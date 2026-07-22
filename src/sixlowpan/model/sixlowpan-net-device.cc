@@ -1369,11 +1369,23 @@ SixLowPanNetDevice::CanCompressLowPanNhc(uint8_t nextHeader)
     {
     case Ipv6Header::IPV6_UDP:
     case Ipv6Header::IPV6_EXT_HOP_BY_HOP:
-    case Ipv6Header::IPV6_EXT_ROUTING:
     case Ipv6Header::IPV6_EXT_FRAGMENTATION:
     case Ipv6Header::IPV6_IPV6:
         ret = true;
         break;
+    // IPV6_EXT_ROUTING is deliberately not compressed: CompressLowPanNhc() and
+    // DecompressLowPanNhc() below peek and (de)serialize a Routing Header
+    // through the bare Ipv6ExtensionRoutingHeader base class, which only
+    // covers its common 4-byte prefix (Next Header, Hdr Ext Len, Routing
+    // Type, Segments Left) and knows nothing of a concrete Routing Type's own
+    // fields, e.g. the address list RFC 6554 or RFC 2460 RH0 carry whenever
+    // Segments Left is nonzero. Attempting NHC compression on one silently
+    // truncates it to those 4 bytes, corrupting the packet. A correct fix
+    // needs the same per-type dispatch Ipv6ExtensionRoutingDemux already
+    // does at the routing layer; until then, a Routing Header is sent
+    // through the uncompressed LOWPAN_IPv6 fallback below, which is exact
+    // regardless of the concrete Routing Type.
+    case Ipv6Header::IPV6_EXT_ROUTING:
     case Ipv6Header::IPV6_EXT_MOBILITY:
     default:
         ret = false;
