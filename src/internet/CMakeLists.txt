@@ -191,6 +191,7 @@ set(header_files
     model/ipv6-interface.h
     model/ipv6-l3-protocol.h
     model/ipv6-list-routing.h
+    model/ipv6-option-demux.h
     model/ipv6-option-header.h
     model/ipv6-option.h
     model/ipv6-packet-filter.h
