@@ -7,6 +7,7 @@ build_lib(
     model/lr-wpan-fields.cc
     model/lr-wpan-interference-helper.cc
     model/lr-wpan-lqi-tag.cc
+    model/lr-wpan-rssi-tag.cc
     model/lr-wpan-mac-header.cc
     model/lr-wpan-mac-pl-headers.cc
     model/lr-wpan-mac-trailer.cc
@@ -24,6 +25,7 @@ build_lib(
     model/lr-wpan-fields.h
     model/lr-wpan-interference-helper.h
     model/lr-wpan-lqi-tag.h
+    model/lr-wpan-rssi-tag.h
     model/lr-wpan-mac-header.h
     model/lr-wpan-mac-pl-headers.h
     model/lr-wpan-mac-trailer.h

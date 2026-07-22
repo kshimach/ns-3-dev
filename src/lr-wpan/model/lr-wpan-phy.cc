@@ -12,6 +12,7 @@
 #include "lr-wpan-constants.h"
 #include "lr-wpan-error-model.h"
 #include "lr-wpan-lqi-tag.h"
+#include "lr-wpan-rssi-tag.h"
 #include "lr-wpan-net-device.h"
 #include "lr-wpan-spectrum-signal-parameters.h"
 #include "lr-wpan-spectrum-value-helper.h"
@@ -596,6 +597,11 @@ LrWpanPhy::EndRx(Ptr<SpectrumSignalParameters> par)
         currentPacket->PeekPacketTag(tag);
         m_phyRxEndTrace(currentPacket, tag.Get());
 
+        // Unlike the LQI, computed incrementally across CheckInterference() as the
+        // packet comes in, the RSSI is a single measurement taken once, over the
+        // preamble (see EndPreamble()), so it only needs adding once here.
+        currentPacket->AddPacketTag(LrWpanRssiTag(m_rssi));
+
         if (!m_currentRxPacket.second)
         {
             m_currentRxPacket = std::make_pair(nullptr, true);
@@ -657,9 +663,11 @@ LrWpanPhy::PdDataRequest(const uint32_t psduLength, Ptr<Packet> p)
             // send down
             NS_ASSERT(m_channel);
 
-            // Remove a possible LQI tag from a previous transmission of the packet.
+            // Remove a possible LQI/RSSI tag from a previous transmission of the packet.
             LrWpanLqiTag lqiTag;
             p->RemovePacketTag(lqiTag);
+            LrWpanRssiTag rssiTag;
+            p->RemovePacketTag(rssiTag);
 
             m_phyTxBeginTrace(p);
             m_currentTxPacket.first = p;
