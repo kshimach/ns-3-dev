@@ -935,6 +935,11 @@ Ipv6L3Protocol::Send(Ptr<Packet> packet,
     {
         NS_LOG_LOGIC("Ipv6L3Protocol::Send case 1: passed in with a route");
         hdr = BuildHeader(source, destination, protocol, packet->GetSize(), ttl, tclass);
+        if (m_routingProtocol)
+        {
+            m_routingProtocol->PrepareOutgoingPacket(packet, hdr, route);
+            hdr.SetPayloadLength(packet->GetSize());
+        }
         int32_t interface = GetInterfaceForDevice(route->GetOutputDevice());
         m_sendOutgoingTrace(hdr, packet, interface);
         SendRealOut(route, packet, hdr);
@@ -946,6 +951,11 @@ Ipv6L3Protocol::Send(Ptr<Packet> packet,
     {
         NS_LOG_LOGIC("Ipv6L3Protocol::Send case 2: probably sent to machine on same IPv6 network");
         hdr = BuildHeader(source, destination, protocol, packet->GetSize(), ttl, tclass);
+        if (m_routingProtocol)
+        {
+            m_routingProtocol->PrepareOutgoingPacket(packet, hdr, route);
+            hdr.SetPayloadLength(packet->GetSize());
+        }
         int32_t interface = GetInterfaceForDevice(route->GetOutputDevice());
         m_sendOutgoingTrace(hdr, packet, interface);
         SendRealOut(route, packet, hdr);
@@ -974,6 +984,8 @@ Ipv6L3Protocol::Send(Ptr<Packet> packet,
 
     if (newRoute)
     {
+        m_routingProtocol->PrepareOutgoingPacket(packet, hdr, newRoute);
+        hdr.SetPayloadLength(packet->GetSize());
         int32_t interface = GetInterfaceForDevice(newRoute->GetOutputDevice());
         m_sendOutgoingTrace(hdr, packet, interface);
         SendRealOut(newRoute, packet, hdr);

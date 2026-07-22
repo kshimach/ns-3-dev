@@ -211,6 +211,36 @@ class Ipv6RoutingProtocol : public Object
      */
     virtual void PrintRoutingTable(Ptr<OutputStreamWrapper> stream,
                                    Time::Unit unit = Time::S) const = 0;
+
+    /**
+     * @brief Give a routing protocol the chance to modify a packet it just
+     *        routed with RouteOutput(), before it is handed to the device.
+     *
+     * This runs only at the node that originates the packet, once per packet,
+     * immediately before it leaves Ipv6L3Protocol::Send(). The default does
+     * nothing. A protocol that needs to add an IPv6 extension header can do so
+     * here: change the packet and, if the extension changes what follows the
+     * IPv6 header, header's next header field, here; Ipv6L3Protocol::Send()
+     * recomputes the payload length from the packet afterwards, so this is the
+     * one place in ns-3 where a routing protocol can put an extension header
+     * onto a packet at the point it originates, something RouteOutput() cannot
+     * do since the packet it is handed is still headerless at that point and
+     * the IPv6 header ns-3 builds around the two calls is otherwise fixed.
+     *
+     * This is not called again as the packet is forwarded at each subsequent
+     * hop: a routing header meant to be consumed hop-by-hop has to arrange
+     * that itself, e.g. through an Ipv6ExtensionRouting registered on the
+     * Ipv6ExtensionRoutingDemux, the way Ipv6ExtensionLooseRouting does for
+     * RFC 6554's predecessor, the Type 0 Routing Header.
+     *
+     * @param packet the packet as it will be sent, without the IPv6 header
+     * @param header the IPv6 header that will be prepended; the next header
+     *               field is not used yet and read on return
+     * @param route the route RouteOutput() returned for this packet
+     */
+    virtual void PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header, Ptr<Ipv6Route> route)
+    {
+    }
 };
 
 } // namespace ns3

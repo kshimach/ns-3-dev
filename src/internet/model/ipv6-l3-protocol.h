@@ -34,6 +34,11 @@ class Ipv6RawSocketImpl;
 class Icmpv6L4Protocol;
 class Ipv6AutoconfiguredPrefix;
 
+namespace rpl
+{
+class RplIpv6ExtensionSourceRouting;
+}
+
 /**
  * @ingroup ipv6
  *
@@ -503,6 +508,14 @@ class Ipv6L3Protocol : public Ipv6
      * @relates Ipv6ExtensionLooseRouting
      */
     friend class Ipv6ExtensionLooseRouting;
+    /**
+     * @brief RPL's own Routing Header extension (RFC 6554), out-of-tree in
+     *        contrib/rpl, needs the same access SendRealOut() already grants
+     *        Ipv6ExtensionLooseRouting to re-inject a packet at the node it
+     *        is currently addressed to.
+     * @relates ns3::rpl::RplIpv6ExtensionSourceRouting
+     */
+    friend class rpl::RplIpv6ExtensionSourceRouting;
 
     /**
      * @brief Container of the IPv6 Interfaces.
