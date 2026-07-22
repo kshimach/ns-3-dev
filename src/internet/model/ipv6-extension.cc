@@ -884,7 +884,7 @@ Ipv6ExtensionRouting::Process(Ptr<Packet>& packet,
     p->RemoveAtStart(offset);
 
     uint8_t buf[4];
-    packet->CopyData(buf, sizeof(buf));
+    p->CopyData(buf, sizeof(buf));
 
     uint8_t routingNextHeader = buf[0];
     uint8_t routingLength = buf[1];
