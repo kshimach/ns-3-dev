@@ -213,6 +213,26 @@ Ipv6ListRouting::NotifyRemoveRoute(Ipv6Address dst,
 }
 
 void
+Ipv6ListRouting::PrepareOutgoingPacket(Ptr<Packet> packet,
+                                       Ipv6Header& header,
+                                       Ptr<Ipv6Route> route)
+{
+    NS_LOG_FUNCTION(this << packet << header << route);
+    // Offer the hook to every member protocol, the same way the Notify*
+    // methods above fan out: RouteOutput() does not record which member
+    // produced this route (and cases 1 and 2 of Ipv6L3Protocol::Send() arrive
+    // with a cached route without calling RouteOutput() at all), so there is
+    // no reliable single winner to forward to. Each member's
+    // PrepareOutgoingPacket() decides for itself whether the packet is its
+    // own -- the default is a no-op -- so fanning out is safe.
+    for (auto rprotoIter = m_routingProtocols.begin(); rprotoIter != m_routingProtocols.end();
+         rprotoIter++)
+    {
+        (*rprotoIter).second->PrepareOutgoingPacket(packet, header, route);
+    }
+}
+
+void
 Ipv6ListRouting::PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Unit unit) const
 {
     NS_LOG_FUNCTION(this);

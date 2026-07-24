@@ -79,6 +79,15 @@ class Ipv6ARouting : public Ipv6RoutingProtocol
     void PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Unit unit) const override
     {
     }
+
+    void PrepareOutgoingPacket(Ptr<Packet> packet,
+                               Ipv6Header& header,
+                               Ptr<Ipv6Route> route) override
+    {
+        m_prepareOutgoingCalled = true;
+    }
+
+    bool m_prepareOutgoingCalled = false; //!< set when PrepareOutgoingPacket() is called
 };
 
 /**
@@ -147,6 +156,15 @@ class Ipv6BRouting : public Ipv6RoutingProtocol
     void PrintRoutingTable(Ptr<OutputStreamWrapper> stream, Time::Unit unit) const override
     {
     }
+
+    void PrepareOutgoingPacket(Ptr<Packet> packet,
+                               Ipv6Header& header,
+                               Ptr<Ipv6Route> route) override
+    {
+        m_prepareOutgoingCalled = true;
+    }
+
+    bool m_prepareOutgoingCalled = false; //!< set when PrepareOutgoingPacket() is called
 };
 
 /**
@@ -225,6 +243,48 @@ Ipv6ListRoutingPositiveTestCase::DoRun()
 /**
  * @ingroup internet-test
  *
+ * @brief Check that Ipv6ListRouting forwards PrepareOutgoingPacket() to its
+ *        member protocols.
+ */
+class Ipv6ListRoutingPrepareOutgoingPacketTestCase : public TestCase
+{
+  public:
+    Ipv6ListRoutingPrepareOutgoingPacketTestCase();
+    void DoRun() override;
+};
+
+Ipv6ListRoutingPrepareOutgoingPacketTestCase::Ipv6ListRoutingPrepareOutgoingPacketTestCase()
+    : TestCase("Check PrepareOutgoingPacket is forwarded to member protocols")
+{
+}
+
+void
+Ipv6ListRoutingPrepareOutgoingPacketTestCase::DoRun()
+{
+    Ptr<Ipv6ListRouting> lr = CreateObject<Ipv6ListRouting>();
+    Ptr<Ipv6ARouting> aRouting = CreateObject<Ipv6ARouting>();
+    Ptr<Ipv6BRouting> bRouting = CreateObject<Ipv6BRouting>();
+    lr->AddRoutingProtocol(aRouting, 10);
+    lr->AddRoutingProtocol(bRouting, 5);
+
+    Ptr<Packet> packet = Create<Packet>();
+    Ipv6Header header;
+    Ptr<Ipv6Route> route = Create<Ipv6Route>();
+    lr->PrepareOutgoingPacket(packet, header, route);
+
+    // The hook must reach every member; before the forwarding override was
+    // added it fell back to the base-class no-op and neither was called.
+    NS_TEST_ASSERT_MSG_EQ(aRouting->m_prepareOutgoingCalled,
+                          true,
+                          "PrepareOutgoingPacket not forwarded to member A");
+    NS_TEST_ASSERT_MSG_EQ(bRouting->m_prepareOutgoingCalled,
+                          true,
+                          "PrepareOutgoingPacket not forwarded to member B");
+}
+
+/**
+ * @ingroup internet-test
+ *
  * @brief IPv6 ListRouting TestSuite
  */
 class Ipv6ListRoutingTestSuite : public TestSuite
@@ -235,6 +295,8 @@ class Ipv6ListRoutingTestSuite : public TestSuite
     {
         AddTestCase(new Ipv6ListRoutingPositiveTestCase(), TestCase::Duration::QUICK);
         AddTestCase(new Ipv6ListRoutingNegativeTestCase(), TestCase::Duration::QUICK);
+        AddTestCase(new Ipv6ListRoutingPrepareOutgoingPacketTestCase(),
+                    TestCase::Duration::QUICK);
     }
 };
 

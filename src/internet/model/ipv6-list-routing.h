@@ -105,6 +105,9 @@ class Ipv6ListRouting : public Ipv6RoutingProtocol
     void SetIpv6(Ptr<Ipv6> ipv6) override;
     void PrintRoutingTable(Ptr<OutputStreamWrapper> stream,
                            Time::Unit unit = Time::S) const override;
+    void PrepareOutgoingPacket(Ptr<Packet> packet,
+                               Ipv6Header& header,
+                               Ptr<Ipv6Route> route) override;
 
   protected:
     /**
