@@ -208,6 +208,17 @@ Ping::Receive(Ptr<Socket> socket)
 
                 if (appSignature == m_appSignature)
                 {
+                    if (echo.GetSequenceNumber() >= m_sent.size())
+                    {
+                        // The sequence number comes straight off the wire; a
+                        // reply to a request this instance never sent (e.g.
+                        // corrupted in transit, or a stray/duplicate packet)
+                        // must not be trusted as a m_sent index.
+                        NS_LOG_INFO("Echo Reply with an unknown sequence number "
+                                    << echo.GetSequenceNumber() << ", discarding");
+                        return;
+                    }
+
                     Time sendTime = m_sent.at(echo.GetSequenceNumber()).txTime;
                     NS_ASSERT(Simulator::Now() >= sendTime);
                     Time delta = Simulator::Now() - sendTime;
@@ -307,6 +318,17 @@ Ping::Receive(Ptr<Socket> socket)
 
                 if (appSignature == m_appSignature)
                 {
+                    if (echo.GetSeq() >= m_sent.size())
+                    {
+                        // The sequence number comes straight off the wire; a
+                        // reply to a request this instance never sent (e.g.
+                        // corrupted in transit, or a stray/duplicate packet)
+                        // must not be trusted as a m_sent index.
+                        NS_LOG_INFO("Echo Reply with an unknown sequence number "
+                                    << echo.GetSeq() << ", discarding");
+                        return;
+                    }
+
                     Time sendTime = m_sent.at(echo.GetSeq()).txTime;
                     NS_ASSERT(Simulator::Now() >= sendTime);
                     Time delta = Simulator::Now() - sendTime;
