@@ -413,6 +413,20 @@ LrWpanPhy::EndPreamble(Ptr<LrWpanSpectrumSignalParameters> lrWpanRxParams)
             LrWpanSpectrumValueHelper::TotalAvgPower(interferenceAndNoise,
                                                      m_phyPIBAttributes.phyCurrentChannel);
 
+        // Calculate RSSI. This is the received signal strength, a measurement
+        // of the whole received power, so it does not depend on whether the
+        // packet turns out to be decodable and is taken for every received
+        // packet: EndRx() tags even a dropped, undecodable packet with its own
+        // RSSI this way, rather than a stale value left over from an earlier,
+        // decodable one.
+        // In theory the RSSI calculation should be done in the PHR, not at the
+        // end of the preamble. However since there is not much difference in
+        // ns-3, it is done here for simplicity (we avoid an extra endSFD event).
+        m_rssi = static_cast<int8_t>(10 * log10(LrWpanSpectrumValueHelper::TotalAvgPower(
+                                              m_signal->GetSignalPsd(),
+                                              m_phyPIBAttributes.phyCurrentChannel)) +
+                                     30);
+
         // Figure out if packet is decodable based on SINR.
         // Std. 802.15.4-2006, appendix E, Figure E.2
         // At SNR < -5 the BER is less than 10e-1.
@@ -429,15 +443,6 @@ LrWpanPhy::EndPreamble(Ptr<LrWpanSpectrumSignalParameters> lrWpanRxParams)
             m_phyRxBeginTrace(p);
 
             m_rxLastUpdate = Simulator::Now();
-
-            // Calculate RSSI
-            // In theory, the RSSI calculation should be done in the PHR, not at the end
-            // of the preamble. However since there is not much difference in ns-3, it
-            // is done here for simplicity (We avoid doing an extra endSFD event)
-            m_rssi = static_cast<int8_t>(10 * log10(LrWpanSpectrumValueHelper::TotalAvgPower(
-                                                  m_signal->GetSignalPsd(),
-                                                  m_phyPIBAttributes.phyCurrentChannel)) +
-                                         30);
         }
         else
         {

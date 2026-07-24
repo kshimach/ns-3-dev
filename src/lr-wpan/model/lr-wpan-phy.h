@@ -905,7 +905,7 @@ class LrWpanPhy : public SpectrumPhy
      * last received packet. This is calculated during the SHR portion of the packet.
      * This value has a typical range of -100 dBm to 0 dBm
      */
-    int8_t m_rssi;
+    int8_t m_rssi{0};
 
     /**
      * Helper value for the peak power value during CCA.
