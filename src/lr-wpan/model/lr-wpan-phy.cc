@@ -33,6 +33,7 @@
 #include "ns3/spectrum-channel.h"
 #include "ns3/spectrum-value.h"
 
+#include <algorithm>
 #include <array>
 
 namespace ns3
@@ -422,10 +423,16 @@ LrWpanPhy::EndPreamble(Ptr<LrWpanSpectrumSignalParameters> lrWpanRxParams)
         // In theory the RSSI calculation should be done in the PHR, not at the
         // end of the preamble. However since there is not much difference in
         // ns-3, it is done here for simplicity (we avoid an extra endSFD event).
-        m_rssi = static_cast<int8_t>(10 * log10(LrWpanSpectrumValueHelper::TotalAvgPower(
-                                              m_signal->GetSignalPsd(),
-                                              m_phyPIBAttributes.phyCurrentChannel)) +
-                                     30);
+        double rssiDbm =
+            10 * log10(LrWpanSpectrumValueHelper::TotalAvgPower(
+                     m_signal->GetSignalPsd(),
+                     m_phyPIBAttributes.phyCurrentChannel)) +
+            30;
+        // Clamp before the narrowing cast. A lone, very weak signal (now that
+        // the RSSI is measured for undecodable packets too) can compute a value
+        // below the int8_t floor, which would otherwise wrap to a large
+        // positive number and tag the packet with a nonsensically strong RSSI.
+        m_rssi = static_cast<int8_t>(std::clamp(rssiDbm, -128.0, 127.0));
 
         // Figure out if packet is decodable based on SINR.
         // Std. 802.15.4-2006, appendix E, Figure E.2
