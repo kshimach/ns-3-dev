@@ -883,8 +883,24 @@ Ipv6ExtensionRouting::Process(Ptr<Packet>& packet,
     Ptr<Packet> p = packet->Copy();
     p->RemoveAtStart(offset);
 
-    uint8_t buf[4];
-    p->CopyData(buf, sizeof(buf));
+    Ptr<Icmpv6L4Protocol> icmpv6 = GetNode()->GetObject<Ipv6L3Protocol>()->GetIcmpv6();
+
+    uint8_t buf[4] = {0};
+    if (p->CopyData(buf, sizeof(buf)) < sizeof(buf))
+    {
+        // Fewer bytes remain than the routing header's fixed part, so buf
+        // would otherwise be read past what CopyData() actually wrote.
+        // Same malformed-header handling as the unrecognized-type case below.
+        NS_LOG_LOGIC("Malformed header (packet too short). Drop!");
+        icmpv6->SendErrorParameterError(malformedPacket,
+                                        ipv6Header.GetSource(),
+                                        Icmpv6Header::ICMPV6_MALFORMED_HEADER,
+                                        offset);
+        dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
+        isDropped = true;
+        stopProcessing = true;
+        return 0;
+    }
 
     uint8_t routingNextHeader = buf[0];
     uint8_t routingLength = buf[1];
@@ -895,8 +911,6 @@ Ipv6ExtensionRouting::Process(Ptr<Packet>& packet,
     {
         *nextHeader = routingNextHeader;
     }
-
-    Ptr<Icmpv6L4Protocol> icmpv6 = GetNode()->GetObject<Ipv6L3Protocol>()->GetIcmpv6();
 
     Ptr<Ipv6ExtensionRoutingDemux> ipv6ExtensionRoutingDemux =
         GetNode()->GetObject<Ipv6ExtensionRoutingDemux>();
