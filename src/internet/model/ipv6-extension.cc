@@ -1109,9 +1109,51 @@ Ipv6ExtensionLooseRouting::Process(Ptr<Packet>& packet,
     ipv6Header.Serialize(it);
     ipv6header.Deserialize(it);
 
+    Ptr<Icmpv6L4Protocol> icmpv6 = GetNode()->GetObject<Ipv6L3Protocol>()->GetIcmpv6();
+
     // Get the number of routers' address field
-    uint8_t buf[2];
-    p->CopyData(buf, sizeof(buf));
+    uint8_t buf[2] = {0};
+    if (p->CopyData(buf, sizeof(buf)) < sizeof(buf))
+    {
+        // Fewer bytes remain than even the Length field, so there is
+        // nothing left to safely learn the full header size from. Same
+        // malformed-header handling as Ipv6ExtensionRouting::Process()'s
+        // analogous guard against its own fixed-size read, just above this
+        // class in the file.
+        NS_LOG_LOGIC("Malformed header (packet too short). Drop!");
+        icmpv6->SendErrorParameterError(malformedPacket,
+                                        ipv6header.GetSource(),
+                                        Icmpv6Header::ICMPV6_MALFORMED_HEADER,
+                                        offset);
+        dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
+        isDropped = true;
+        stopProcessing = true;
+        return 0;
+    }
+
+    // buf[1] is the Length field (RFC 2460 section 4.4): the header's size
+    // in 8-octet units minus 1, i.e. twice the router address count here.
+    // Ipv6ExtensionLooseRoutingHeader::Deserialize() (below, via
+    // RemoveHeader()) reads that many 16-byte addresses with no bound check
+    // of its own, so a packet truncated shorter than the size the Length
+    // field declares -- 8 fixed bytes plus 16 per address -- has to be
+    // caught here, before that unconditional read runs past what is
+    // actually left in the packet.
+    uint8_t declaredAddressNum = buf[1] / 2;
+    uint32_t declaredSize = 8 + uint32_t(declaredAddressNum) * 16;
+    if (p->GetSize() < declaredSize)
+    {
+        NS_LOG_LOGIC("Malformed header (packet too short for declared address count). Drop!");
+        icmpv6->SendErrorParameterError(malformedPacket,
+                                        ipv6header.GetSource(),
+                                        Icmpv6Header::ICMPV6_MALFORMED_HEADER,
+                                        offset + 1);
+        dropReason = Ipv6L3Protocol::DROP_MALFORMED_HEADER;
+        isDropped = true;
+        stopProcessing = true;
+        return 0;
+    }
+
     Ipv6ExtensionLooseRoutingHeader routingHeader;
     p->RemoveHeader(routingHeader);
 
@@ -1119,8 +1161,6 @@ Ipv6ExtensionLooseRouting::Process(Ptr<Packet>& packet,
     {
         *nextHeader = routingHeader.GetNextHeader();
     }
-
-    Ptr<Icmpv6L4Protocol> icmpv6 = GetNode()->GetObject<Ipv6L3Protocol>()->GetIcmpv6();
 
     Ipv6Address srcAddress = ipv6header.GetSource();
     Ipv6Address destAddress = ipv6header.GetDestination();
