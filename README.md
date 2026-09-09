@@ -11,8 +11,61 @@
 This software is licensed under the terms of the GNU General Public License v2.0 only (GPL-2.0-only).
 See the LICENSE file for more details.
 
+## RPL Module (this fork)
+
+*This section is specific to the `kshimach/ns-3-dev` fork and its `rpl` branch;
+it does not exist in the upstream ns-3 project.*
+
+The `rpl` branch of this fork adds RFC 6550 RPL routing (with RFC 6997 P2P-RPL
+and RFC 9854 AODV-RPL extensions), plus a handful of small ns-3 core (`src/`)
+fixes that RPL depends on -- registering its own IPv6 extension header/option,
+forwarding a hook through `Ipv6ListRouting`, and a few 6LoWPAN/lr-wpan
+correctness fixes. See the branch's commit history (`git log master..rpl`) for
+details on each one.
+
+The RPL module itself (`contrib/rpl`) is **not included in this repository**:
+`contrib/` is gitignored here, and the module lives in its own separate
+repository, <https://github.com/kshimach/rpl>. To build with RPL, clone both
+repositories and place `rpl` under `contrib/`:
+
+```shell
+git clone -b rpl https://github.com/kshimach/ns-3-dev.git
+cd ns-3-dev
+git clone https://github.com/kshimach/rpl.git contrib/rpl
+./ns3 configure --enable-examples --enable-tests
+./ns3 build
+./test.py -s rpl
+```
+
+### RPL モジュール (このフォーク限定)
+
+*このセクションは `kshimach/ns-3-dev` フォークの `rpl` ブランチに固有のもので、
+本家 ns-3 プロジェクトには存在しません。*
+
+このフォークの `rpl` ブランチは、RFC 6550 の RPL ルーティング (RFC 6997
+P2P-RPL・RFC 9854 AODV-RPL 拡張を含む) と、それが依存する ns-3 コア (`src/`)
+側の小さな修正をいくつか追加しています -- 独自の IPv6 拡張ヘッダ/オプションの
+登録、`Ipv6ListRouting` へのフック転送、6LoWPAN/lr-wpan のいくつかの正確性
+修正などです。それぞれの詳細はブランチのコミット履歴 (`git log master..rpl`)
+を参照してください。
+
+RPL モジュール本体 (`contrib/rpl`) は**このリポジトリには含まれていません**。
+`contrib/` はこのリポジトリで gitignore されており、モジュールは別リポジトリ
+<https://github.com/kshimach/rpl> にあります。RPL 込みでビルドするには、
+両方のリポジトリを clone して `rpl` を `contrib/` 配下に配置してください:
+
+```shell
+git clone -b rpl https://github.com/kshimach/ns-3-dev.git
+cd ns-3-dev
+git clone https://github.com/kshimach/rpl.git contrib/rpl
+./ns3 configure --enable-examples --enable-tests
+./ns3 build
+./test.py -s rpl
+```
+
 ## Table of Contents
 
+* [RPL Module (this fork)](#rpl-module-this-fork)
 * [Overview](#overview-an-open-source-project)
 * [Software overview](#software-overview)
 * [Getting ns-3](#getting-ns-3)
