@@ -1,0 +1,3 @@
+[submodule "contrib/rpl"]
+	path = contrib/rpl
+	url = https://github.com/kshimach/rpl.git

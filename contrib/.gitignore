@@ -3,3 +3,7 @@
 
 # Include specific files that should be tracked by Git
 !.gitignore
+
+# rpl is a git submodule (github.com/kshimach/rpl), tracked as a gitlink
+# entry rather than as ordinary files, so it needs its own exception.
+!rpl
