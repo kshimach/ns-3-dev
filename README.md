@@ -23,19 +23,24 @@ forwarding a hook through `Ipv6ListRouting`, and a few 6LoWPAN/lr-wpan
 correctness fixes. See the branch's commit history (`git log master..rpl`) for
 details on each one.
 
-The RPL module itself (`contrib/rpl`) is **not included in this repository**:
-`contrib/` is gitignored here, and the module lives in its own separate
-repository, <https://github.com/kshimach/rpl>. To build with RPL, clone both
-repositories and place `rpl` under `contrib/`:
+The RPL module itself lives in its own separate repository,
+<https://github.com/kshimach/rpl> -- it keeps its own license and authorship,
+independent of this one -- and is linked in here as a git submodule at
+`contrib/rpl` (`contrib/` is otherwise gitignored). One clone with
+`--recurse-submodules` gets both:
 
 ```shell
-git clone -b rpl https://github.com/kshimach/ns-3-dev.git
+git clone --recurse-submodules -b rpl https://github.com/kshimach/ns-3-dev.git
 cd ns-3-dev
-git clone https://github.com/kshimach/rpl.git contrib/rpl
 ./ns3 configure --enable-examples --enable-tests
 ./ns3 build
 ./test.py -s rpl
 ```
+
+If you already have a plain clone without `contrib/rpl` populated, run
+`git submodule update --init` instead of re-cloning. To pull in a newer
+commit of the RPL module later, `cd contrib/rpl && git pull`, then commit
+the updated submodule pointer from the top-level repository.
 
 ### RPL モジュール (このフォーク限定)
 
@@ -49,19 +54,25 @@ P2P-RPL・RFC 9854 AODV-RPL 拡張を含む) と、それが依存する ns-3 �
 修正などです。それぞれの詳細はブランチのコミット履歴 (`git log master..rpl`)
 を参照してください。
 
-RPL モジュール本体 (`contrib/rpl`) は**このリポジトリには含まれていません**。
-`contrib/` はこのリポジトリで gitignore されており、モジュールは別リポジトリ
-<https://github.com/kshimach/rpl> にあります。RPL 込みでビルドするには、
-両方のリポジトリを clone して `rpl` を `contrib/` 配下に配置してください:
+RPL モジュール本体は別リポジトリ <https://github.com/kshimach/rpl> にあり、
+ライセンス・著作権表記もこのリポジトリとは独立しています。`contrib/` は
+このリポジトリで gitignore されていますが、`contrib/rpl` は git submodule
+としてリンクしてあります。`--recurse-submodules` を付けて clone すれば
+1 コマンドで両方取得できます:
 
 ```shell
-git clone -b rpl https://github.com/kshimach/ns-3-dev.git
+git clone --recurse-submodules -b rpl https://github.com/kshimach/ns-3-dev.git
 cd ns-3-dev
-git clone https://github.com/kshimach/rpl.git contrib/rpl
 ./ns3 configure --enable-examples --enable-tests
 ./ns3 build
 ./test.py -s rpl
 ```
+
+`contrib/rpl` が空のまま既に clone 済みの場合は、再 clone せず
+`git submodule update --init` を実行してください。RPL モジュール側の
+新しいコミットを取り込みたい場合は `cd contrib/rpl && git pull` した後、
+トップレベルのリポジトリで更新された submodule のポインタをコミットして
+ください。
 
 ## Table of Contents
 
