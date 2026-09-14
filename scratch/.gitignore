@@ -6,3 +6,9 @@
 !subdir/
 !scratch-simulator.cc
 !CMakeLists.txt
+
+# Large-scale RPL/P2P-RPL/AODV-RPL system test suite
+# (rpl_large_scale_test_specification.md).
+!rpl-large-scale-system-test.cc
+!evaluate_test_results.py
+!system-test-run-all.sh
