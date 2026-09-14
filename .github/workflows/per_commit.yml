@@ -8,6 +8,8 @@ jobs:
       cache_misses: ${{ env.cache_misses }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install required packages
         run: |
           sudo apt-get update
@@ -53,6 +55,8 @@ jobs:
     if: needs.Ubuntu.outputs.cache_misses != '0'
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install required packages
         run: |
           sudo apt-get update
@@ -104,6 +108,8 @@ jobs:
         shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: msys2/setup-msys2@v2
       - name: Install required msys2/mingw64 packages
         run: |
@@ -160,6 +166,8 @@ jobs:
         os: [ macos-latest, macos-14 ]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install required packages
         run: |
           brew uninstall cmake ninja
@@ -204,6 +212,8 @@ jobs:
         shell: cmd
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
       - name: Configure CMake
         run: |
