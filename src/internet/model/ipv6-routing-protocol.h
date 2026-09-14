@@ -238,9 +238,7 @@ class Ipv6RoutingProtocol : public Object
      *               field is not used yet and read on return
      * @param route the route RouteOutput() returned for this packet
      */
-    virtual void PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header, Ptr<Ipv6Route> route)
-    {
-    }
+    virtual void PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header, Ptr<Ipv6Route> route);
 };
 
 } // namespace ns3

@@ -8,6 +8,8 @@
 
 #include "ipv6-routing-protocol.h"
 
+#include "ipv6-route.h"
+
 #include "ns3/assert.h"
 
 namespace ns3
@@ -21,6 +23,11 @@ Ipv6RoutingProtocol::GetTypeId()
     static TypeId tid =
         TypeId("ns3::Ipv6RoutingProtocol").SetParent<Object>().SetGroupName("Internet");
     return tid;
+}
+
+void
+Ipv6RoutingProtocol::PrepareOutgoingPacket(Ptr<Packet> packet, Ipv6Header& header, Ptr<Ipv6Route> route)
+{
 }
 
 } /* namespace ns3 */
