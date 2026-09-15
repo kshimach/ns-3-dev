@@ -207,6 +207,14 @@ jobs:
         run: ./test.py --no-build --verbose-failed
   Windows_Visual_Studio:
     runs-on: windows-latest
+    # This job has no ccache and unconditionally runs the full test.py suite
+    # (unlike the other jobs, which skip it on a cache hit), and Windows/MSVC
+    # execution of ns-3 examples is known to be much slower than Linux/macOS;
+    # a generous but finite bound turns a genuine hang (observed once: the
+    # runner lost contact with GitHub after 4h+ with no job-level timeout to
+    # stop it) into a bounded, visible failure instead of a silent multi-hour
+    # cost.
+    timeout-minutes: 240
     defaults:
       run:
         shell: cmd
