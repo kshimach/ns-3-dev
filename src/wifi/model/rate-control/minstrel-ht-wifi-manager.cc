@@ -2082,9 +2082,14 @@ MinstrelHtWifiManager::GetIdInGroup(WifiModulationClass mc,
 {
     NS_LOG_FUNCTION(this << mc << streams << guardInterval << chWidth);
     const auto& standardInfos = minstrelHtStandardInfos.at(mc);
-    const auto it = std::find(standardInfos.guardIntervals.cbegin(),
-                              standardInfos.guardIntervals.cend(),
-                              guardInterval);
+    // find_if (not find): MSVC's std::find has a fast path that bit-casts
+    // trivially copyable, word-sized elements for vectorized comparison; on
+    // some MSVC STL versions it gets instantiated for ns3::Time (which is not
+    // trivially copyable -- it has a non-trivial destructor) and fails to
+    // compile. find_if's per-element predicate call never takes that path.
+    const auto it = std::find_if(standardInfos.guardIntervals.cbegin(),
+                                 standardInfos.guardIntervals.cend(),
+                                 [&guardInterval](const Time& gi) { return gi == guardInterval; });
     const auto giIndex = std::distance(standardInfos.guardIntervals.cbegin(), it);
     const auto widthIndex = std::log2(chWidth / MHz_u{20});
     return (standardInfos.maxStreams * standardInfos.guardIntervals.size() * widthIndex) +
