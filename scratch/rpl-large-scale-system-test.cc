@@ -34,8 +34,32 @@ using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("RplLargeScaleSystemTest");
 
+// Fixed RNG stream numbers (evaluation-plan item C-5). Without these, every
+// RandomVariableStream in this file and in contrib/rpl gets its stream
+// index from a single global creation-order counter, so a change anywhere
+// upstream (a new object created one line earlier, a different topology
+// with a different number of ad-hoc RNGs) silently reassigns every stream
+// downstream of it -- including contrib/rpl's own Trickle draws, which this
+// harness never explicitly seeds via RplHelper::AssignStreams(). Pinning
+// fixed, non-overlapping ranges here makes a --RngRun value reproduce the
+// same topology realization, channel realization, and traffic jitter
+// regardless of unrelated code changes elsewhere in this file.
+constexpr int64_t kTopologyStreamBase = 10;  // cluster uses 10,11; random uses 10
+constexpr int64_t kChannelStream = 30;
+constexpr int64_t kTrafficJitterStream = 40;
+constexpr int64_t kPairSelectionStream = 41; // SelectShortcutPairs()'s candidate shuffle
+constexpr int64_t kRplStreamBase = 1000;     // RplHelper::AssignStreams() base
+
 /**
- * @brief UDGM loss model: quadratic loss with Euclidean distance.
+ * @brief UDGM loss model: quadratic loss with Euclidean distance, with an
+ *        optional directional asymmetry coefficient (evaluation-plan item
+ *        C-3). By (tx node id, rx node id) ordered pair: transmissions from
+ *        a lower-id node to a higher-id node (root/upstream nodes are
+ *        created first in every topology builder, so this direction is
+ *        "downstream/outbound") use the base edgeSuccessRate unmodified;
+ *        the reverse direction ("upstream/inbound") has its delivery
+ *        probability multiplied by m_asymmetry. m_asymmetry=1.0 (the
+ *        default) reproduces the original symmetric model exactly.
  */
 class UdgmChannel : public SimpleChannel
 {
@@ -43,12 +67,21 @@ class UdgmChannel : public SimpleChannel
     UdgmChannel()
         : m_rng(CreateObject<UniformRandomVariable>())
     {
+        m_rng->SetStream(kChannelStream);
     }
 
     void SetParameters(double rangeMeters, double edgeSuccessRate)
     {
         m_range = rangeMeters;
         m_edgeSuccessRate = edgeSuccessRate;
+    }
+
+    /// @param asymmetry Multiplier applied to the reverse-direction (higher
+    ///        node id -> lower node id) delivery probability. 1.0 = symmetric
+    ///        (default, matches the original model bit-for-bit).
+    void SetAsymmetry(double asymmetry)
+    {
+        m_asymmetry = asymmetry;
     }
 
     void Send(Ptr<Packet> p,
@@ -74,6 +107,10 @@ class UdgmChannel : public SimpleChannel
             double edgeFraction = (m_range > 0.0) ? (distance / m_range) : 0.0;
             double deliveryProbability =
                 1.0 - (1.0 - m_edgeSuccessRate) * edgeFraction * edgeFraction;
+            if (m_asymmetry != 1.0 && sender->GetNode()->GetId() > receiver->GetNode()->GetId())
+            {
+                deliveryProbability *= m_asymmetry;
+            }
             if (m_rng->GetValue(0.0, 1.0) > deliveryProbability)
             {
                 continue;
@@ -92,6 +129,7 @@ class UdgmChannel : public SimpleChannel
   private:
     double m_range{45.0};          // CommRange in meters
     double m_edgeSuccessRate{0.7}; // delivery probability at CommRange
+    double m_asymmetry{1.0};       // reverse-direction multiplier (1.0 = symmetric)
     Ptr<UniformRandomVariable> m_rng;
 };
 
@@ -405,6 +443,7 @@ BuildRandomTopology(Ptr<ListPositionAllocator> positions, uint32_t nNodes)
     // islands are vanishingly unlikely at this density.
     positions->Add(Vector(110.0, 110.0, 0.0)); // Root at center
     Ptr<UniformRandomVariable> urv = CreateObject<UniformRandomVariable>();
+    urv->SetStream(kTopologyStreamBase);
     urv->SetAttribute("Min", DoubleValue(0.0));
     urv->SetAttribute("Max", DoubleValue(220.0));
     for (uint32_t i = 1; i < nNodes; ++i)
@@ -435,9 +474,11 @@ BuildClusterTopologyChecked(Ptr<ListPositionAllocator> positions,
     }
 
     Ptr<UniformRandomVariable> jitterR = CreateObject<UniformRandomVariable>();
+    jitterR->SetStream(kTopologyStreamBase);
     jitterR->SetAttribute("Min", DoubleValue(0.0));
     jitterR->SetAttribute("Max", DoubleValue(kClusterJitterRadius));
     Ptr<UniformRandomVariable> jitterTheta = CreateObject<UniformRandomVariable>();
+    jitterTheta->SetStream(kTopologyStreamBase + 1);
     jitterTheta->SetAttribute("Min", DoubleValue(0.0));
     jitterTheta->SetAttribute("Max", DoubleValue(2 * M_PI));
 
@@ -797,6 +838,111 @@ BranchNodes(int32_t branch, int32_t minTier = 0)
 
 /// Spec section 5.1's "steady-state PDR (uplink MP2P)" pass criterion is
 /// tiered by UDGM edgeSuccessRate, not a single flat number: at this
+/// Physical (Euclidean) distance between two nodes' installed
+/// ConstantPositionMobilityModel positions. Requires mobility.Install() to
+/// have already run.
+static double
+NodeDistance(uint32_t i, uint32_t j)
+{
+    Ptr<MobilityModel> a = g_nodes.Get(i)->GetObject<MobilityModel>();
+    Ptr<MobilityModel> b = g_nodes.Get(j)->GetObject<MobilityModel>();
+    return a->GetDistanceFrom(b);
+}
+
+/// BFS hop-distance from Root (node 0) to every node, over the same
+/// physical-adjacency graph (edge iff distance <= commRange) UdgmChannel
+/// itself uses for reachability. This is not the Base-RPL DODAG's actual
+/// parent chain (unavailable before the simulation runs, and shaped by
+/// Rank/OF tie-breaking this function does not model) -- it is the
+/// shortest such chain *could possibly be*, which is the right baseline
+/// for "how many hops would a root-traversed route take at minimum".
+static std::vector<uint32_t>
+BfsHopsFromRoot(uint32_t nNodes, double commRange)
+{
+    constexpr uint32_t kUnreached = std::numeric_limits<uint32_t>::max();
+    std::vector<uint32_t> hops(nNodes, kUnreached);
+    hops[0] = 0;
+    std::vector<uint32_t> frontier{0};
+    while (!frontier.empty())
+    {
+        std::vector<uint32_t> next;
+        for (uint32_t u : frontier)
+        {
+            for (uint32_t v = 0; v < nNodes; ++v)
+            {
+                if (hops[v] != kUnreached || v == u)
+                {
+                    continue;
+                }
+                if (NodeDistance(u, v) <= commRange)
+                {
+                    hops[v] = hops[u] + 1;
+                    next.push_back(v);
+                }
+            }
+        }
+        frontier = std::move(next);
+    }
+    return hops;
+}
+
+/// Topology-agnostic replacement for BranchNodes()-based pair selection
+/// (evaluation-plan item C-6). BranchNodes() only works on the Cluster
+/// topology's branch/tier bookkeeping (g_nodeBranch/g_nodeTier), which Grid
+/// and Random topologies never populate (only BuildClusterTopologyChecked()
+/// sets them) -- every reactive-discovery scenario (2 and up) therefore
+/// silently selected zero pairs on those two topologies, confirmed
+/// empirically (discoveryAttempts=0 in the output CSV). This selects up to
+/// nPairs (src, dst) pairs that are physically 1 hop apart (distance <=
+/// commRange, so a P2P-RPL/AODV-RPL direct route is geometrically
+/// possible): by default (wantFar=true) pairs at least minBaseHops apart
+/// via Root (hopsFromRoot[src]+hopsFromRoot[dst]), generalizing the Cluster
+/// topology's deliberately-designed Branch0/Branch1 leaf shortcut (35m
+/// direct vs 10-hop root-traversal); with wantFar=false, the inequality is
+/// reversed, giving ordinary nearby pairs instead (ones a reactive
+/// discovery is not expected to shorten much) for scenarios that also want
+/// a "nothing special" traffic arm alongside the shortcut arm. Candidate
+/// selection uses a fixed-stream RNG (kPairSelectionStream) so a given
+/// --RngRun reproduces the same pair set.
+static std::vector<std::pair<uint32_t, uint32_t>>
+SelectShortcutPairs(uint32_t nNodes,
+                    double commRange,
+                    uint32_t minBaseHops,
+                    uint32_t nPairs,
+                    bool wantFar = true)
+{
+    std::vector<uint32_t> hopsFromRoot = BfsHopsFromRoot(nNodes, commRange);
+    std::vector<std::pair<uint32_t, uint32_t>> candidates;
+    for (uint32_t i = 1; i < nNodes; ++i)
+    {
+        for (uint32_t j = i + 1; j < nNodes; ++j)
+        {
+            if (NodeDistance(i, j) > commRange)
+            {
+                continue;
+            }
+            uint32_t baseHops = hopsFromRoot[i] + hopsFromRoot[j];
+            bool qualifies = wantFar ? (baseHops >= minBaseHops) : (baseHops < minBaseHops);
+            if (qualifies)
+            {
+                candidates.emplace_back(i, j);
+            }
+        }
+    }
+    Ptr<UniformRandomVariable> pick = CreateObject<UniformRandomVariable>();
+    pick->SetStream(kPairSelectionStream);
+    uint32_t limit = std::min<uint32_t>(nPairs, candidates.size());
+    // Partial Fisher-Yates: only the first `limit` slots need to be correct.
+    for (uint32_t k = 0; k < limit; ++k)
+    {
+        auto r =
+            k + static_cast<uint32_t>(pick->GetInteger(0, candidates.size() - 1 - k));
+        std::swap(candidates[k], candidates[r]);
+    }
+    candidates.resize(limit);
+    return candidates;
+}
+
 /// topology's 5-6 hop depth with no L2 ARQ, the theoretical ceiling itself
 /// drops well below any one-size-fits-all threshold as edgeSuccessRate
 /// falls (spec's own worked example: "6-hop theoretical upper bound ~46%,
@@ -848,6 +994,25 @@ main(int argc, char** argv)
     std::string tcCsvPath = "system-test-tc-results.csv";
     bool verbose = false;
 
+    // Evaluation-plan item C-2: expose the reactive-discovery Trickle
+    // parameters and the P2P-DRO-ACK toggle, so H4 (does aligning
+    // AodvDioIntervalMin with P2pDioIntervalMin close the discovery-latency
+    // gap?) and H5 (does disabling P2P-DRO-ACK degrade P2P-RPL's discovery
+    // success rate to AODV-RPL's level?) can be tested directly instead of
+    // only at each protocol's own module default. Defaults below reproduce
+    // contrib/rpl's module defaults (rpl.rst "Attributes"), so omitting
+    // these flags changes nothing.
+    uint32_t p2pDioIntervalMinMs = 64;
+    uint32_t p2pDioIntervalDoublings = 4;
+    uint32_t aodvDioIntervalMinMs = 128;
+    uint32_t aodvDioIntervalDoublings = 4;
+    bool p2pDroAckRequested = true;
+    // Evaluation-plan item C-3: directional channel-quality coefficient for
+    // H8's external validity (does AODV-RPL's asymmetric mode pay off once
+    // the channel is actually asymmetric?). 1.0 reproduces the original
+    // symmetric UdgmChannel exactly.
+    double linkAsymmetry = 1.0;
+
     CommandLine cmd(__FILE__);
     cmd.AddValue("scenario", "1:RPL, 2:P2P, 3:AODV, 4:MIX-P2P, 5:MIX-AODV, 6:CMP", scenario);
     cmd.AddValue("nNodes", "Number of nodes in total (Root + sensors)", nNodes);
@@ -875,6 +1040,25 @@ main(int argc, char** argv)
     cmd.AddValue("csv", "CSV result output path", csvPath);
     cmd.AddValue("tcCsv", "Test-case (TC-xxx) checklist CSV output path", tcCsvPath);
     cmd.AddValue("verbose", "Enable verbose RPL logging", verbose);
+    cmd.AddValue("p2pDioIntervalMinMs",
+                 "P2P-RPL discovery Trickle Imin in ms (module default 64)",
+                 p2pDioIntervalMinMs);
+    cmd.AddValue("p2pDioIntervalDoublings",
+                 "P2P-RPL discovery Trickle doublings (module default 4)",
+                 p2pDioIntervalDoublings);
+    cmd.AddValue("aodvDioIntervalMinMs",
+                 "AODV-RPL discovery Trickle Imin in ms (module default 128)",
+                 aodvDioIntervalMinMs);
+    cmd.AddValue("aodvDioIntervalDoublings",
+                 "AODV-RPL discovery Trickle doublings (module default 4)",
+                 aodvDioIntervalDoublings);
+    cmd.AddValue("p2pDroAckRequested",
+                 "Whether P2P-RPL requests a P2P-DRO-ACK for its replies (module default true)",
+                 p2pDroAckRequested);
+    cmd.AddValue("linkAsymmetry",
+                 "UdgmChannel reverse-direction (higher node id -> lower node id) delivery "
+                 "probability multiplier; 1.0 = symmetric (default)",
+                 linkAsymmetry);
     cmd.Parse(argc, argv);
 
     std::string proto = !reactiveProtocol.empty()
@@ -915,6 +1099,7 @@ main(int argc, char** argv)
     // L2: SimpleNetDevice over UdgmChannel
     Ptr<UdgmChannel> channel = CreateObject<UdgmChannel>();
     channel->SetParameters(commRange, edgeSuccessRate);
+    channel->SetAsymmetry(linkAsymmetry);
     NetDeviceContainer devices;
     for (uint32_t i = 0; i < nNodes; ++i)
     {
@@ -940,6 +1125,11 @@ main(int argc, char** argv)
     rplHelper.Set("DioRedundancy", UintegerValue(dioRedundancy));
     rplHelper.Set("AodvForceAsymmetric", BooleanValue(aodvForceAsymmetric));
     rplHelper.Set("PathLifetime", UintegerValue(pathLifetime));
+    rplHelper.Set("P2pDioIntervalMin", TimeValue(MilliSeconds(p2pDioIntervalMinMs)));
+    rplHelper.Set("P2pDioIntervalDoublings", UintegerValue(p2pDioIntervalDoublings));
+    rplHelper.Set("AodvDioIntervalMin", TimeValue(MilliSeconds(aodvDioIntervalMinMs)));
+    rplHelper.Set("AodvDioIntervalDoublings", UintegerValue(aodvDioIntervalDoublings));
+    rplHelper.Set("P2pDroAckRequested", BooleanValue(p2pDroAckRequested));
     if (scenario == 1)
     {
         // Scenario 1 phase 4 (design spec section 3): force exactly one
@@ -953,6 +1143,16 @@ main(int argc, char** argv)
     internetv6.SetIpv4StackInstall(false);
     internetv6.SetRoutingHelper(rplHelper);
     internetv6.Install(g_nodes);
+    // Evaluation-plan item C-5: without this, every RPL instance's internal
+    // RandomVariableStream objects (Trickle interval draws, retry jitter,
+    // etc.) fall back to auto-assigned stream numbers keyed off creation
+    // order -- this harness never called RplHelper::AssignStreams() before.
+    // Pinning a fixed base makes a given --RngRun reproduce the same
+    // per-node RPL randomness regardless of unrelated code changes
+    // elsewhere in this file (up to nNodes*3 streams consumed per the
+    // header comment on RplRoutingProtocol::AssignStreams(); leaves ample
+    // headroom to the next reserved range).
+    rplHelper.AssignStreams(g_nodes, kRplStreamBase);
 
     Ipv6AddressHelper ipv6;
     Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
@@ -992,7 +1192,8 @@ main(int argc, char** argv)
     // timelines each scenario describes there.
     //
     Simulator::Schedule(Seconds(settleTime + 5.0),
-                        [scenario, nNodes, hopByHop, proto, simTime, settleTime]() {
+                        [scenario, nNodes, hopByHop, proto, simTime, settleTime, topology,
+                         commRange]() {
         g_rootGlobalAddr = g_nodes.Get(0)->GetObject<rpl::RplRoutingProtocol>()->GetGlobalAddress();
         g_rootLinkLocalAddr =
             g_nodes.Get(0)->GetObject<Ipv6L3Protocol>()->GetAddress(1, 0).GetAddress();
@@ -1013,6 +1214,16 @@ main(int argc, char** argv)
             // actually produces).
             uint32_t interval = (scenario == 1) ? 5 : 10;
             uint32_t maxPackets = (scenario == 1) ? 24 : 17;
+            // One shared RNG on a fixed stream (evaluation-plan item C-5),
+            // rather than one auto-streamed RandomVariableStream per node:
+            // the previous per-iteration CreateObject<>() consumed nNodes-1
+            // stream indices whose auto-assigned numbers depended on
+            // everything created earlier in the run, making every draw
+            // after this loop (and every other run's alignment with this
+            // one) depend on nNodes. Draws are still i.i.d. uniform, so the
+            // per-node start-delay jitter itself is unaffected.
+            Ptr<UniformRandomVariable> jit = CreateObject<UniformRandomVariable>();
+            jit->SetStream(kTrafficJitterStream);
             for (uint32_t i = 1; i < nNodes; ++i)
             {
                 UdpClientHelper client(g_rootGlobalAddr, g_trafficPort);
@@ -1020,7 +1231,6 @@ main(int argc, char** argv)
                 client.SetAttribute("PacketSize", UintegerValue(512));
                 client.SetAttribute("MaxPackets", UintegerValue(maxPackets));
                 ApplicationContainer app = client.Install(g_nodes.Get(i));
-                Ptr<UniformRandomVariable> jit = CreateObject<UniformRandomVariable>();
                 double startDelay = jit->GetValue(0.0, 5.0);
                 app.Start(Seconds(startDelay));
                 app.Stop(Seconds(std::min<double>(simTime - settleTime - 5.0, 200.0)));
@@ -1048,19 +1258,29 @@ main(int argc, char** argv)
         {
             // ---- Scenario 2/3: single-protocol reactive discovery ----
             std::vector<std::pair<uint32_t, uint32_t>> pairs;
-            std::vector<uint32_t> leafA = BranchNodes(0, 4);
-            std::vector<uint32_t> leafB = BranchNodes(1, 4);
-            std::vector<uint32_t> leafC = BranchNodes(2, 4);
-            for (std::size_t k = 0; k < leafA.size() && pairs.size() < 15; ++k)
+            if (topology == "cluster")
             {
-                if (k < leafB.size())
+                std::vector<uint32_t> leafA = BranchNodes(0, 4);
+                std::vector<uint32_t> leafB = BranchNodes(1, 4);
+                std::vector<uint32_t> leafC = BranchNodes(2, 4);
+                for (std::size_t k = 0; k < leafA.size() && pairs.size() < 15; ++k)
                 {
-                    pairs.emplace_back(leafA[k], leafB[k]);
+                    if (k < leafB.size())
+                    {
+                        pairs.emplace_back(leafA[k], leafB[k]);
+                    }
+                    if (k < leafC.size() && pairs.size() < 15)
+                    {
+                        pairs.emplace_back(leafB[k % leafB.size()], leafC[k]);
+                    }
                 }
-                if (k < leafC.size() && pairs.size() < 15)
-                {
-                    pairs.emplace_back(leafB[k % leafB.size()], leafC[k]);
-                }
+            }
+            else
+            {
+                // Grid/Random (evaluation-plan item C-6): no branch/tier concept
+                // exists, so select up to 15 generic shortcut-candidate pairs
+                // instead (physically 1 hop, >=8 hops apart via Root).
+                pairs = SelectShortcutPairs(nNodes, commRange, /*minBaseHops=*/8, /*nPairs=*/15);
             }
             // Scenario 3: also chain two Origins onto the SAME Target through a shared
             // relay, to exercise Gratuitous RREP (TC-AODV-03, checked by the wrapper
@@ -1096,56 +1316,91 @@ main(int argc, char** argv)
         else if (scenario == 4)
         {
             // ---- Scenario 4 (RPL x P2P-RPL mixed) ----
-            std::vector<uint32_t> b0 = BranchNodes(0, 4);
-            std::vector<uint32_t> b1 = BranchNodes(1, 4);
-            std::vector<uint32_t> b2Deep = BranchNodes(2, 5);
-            std::vector<uint32_t> b0Deep = BranchNodes(0, 5);
+            // Cluster keeps its original, geometrically-designed branch/tier
+            // selection unchanged; Grid/Random (evaluation-plan item C-6) use
+            // the generic BFS-based pair selector, mapping each arm's intent
+            // (nearby / shortcut / far-beyond-rank-limit) onto SelectShortcutPairs()'s
+            // minBaseHops threshold instead of a branch/tier label.
+            std::vector<std::pair<uint32_t, uint32_t>> nearbyPairs, shortcutPairs, deepPair;
+            if (topology == "cluster")
+            {
+                std::vector<uint32_t> b0 = BranchNodes(0, 4);
+                std::vector<uint32_t> b1 = BranchNodes(1, 4);
+                std::vector<uint32_t> b2Deep = BranchNodes(2, 5);
+                std::vector<uint32_t> b0Deep = BranchNodes(0, 5);
+                for (std::size_t k = 0; k + 1 < b0.size() && nearbyPairs.size() < 5; k += 2)
+                {
+                    nearbyPairs.emplace_back(b0[k], b0[k + 1]);
+                }
+                for (std::size_t k = 0; k < b0.size() && k < b1.size() && k < 5; ++k)
+                {
+                    shortcutPairs.emplace_back(b0[k], b1[k]);
+                }
+                if (!b0Deep.empty() && !b2Deep.empty())
+                {
+                    deepPair.emplace_back(b0Deep[0], b2Deep[0]);
+                }
+            }
+            else
+            {
+                nearbyPairs = SelectShortcutPairs(nNodes, commRange, /*minBaseHops=*/8,
+                                                  /*nPairs=*/5, /*wantFar=*/false);
+                shortcutPairs =
+                    SelectShortcutPairs(nNodes, commRange, /*minBaseHops=*/8, /*nPairs=*/5);
+                // >=17 hops via Root stands in for "beyond default
+                // P2pMaxRank/AodvRankLimit (=8) via any temp-DAG path", matching
+                // Cluster's depth6+depth6=12-hop-plus fallback pair in spirit; if
+                // no such pair exists at this topology/commRange, the arm below
+                // is skipped exactly as it is when Cluster's own b0Deep/b2Deep
+                // come up empty.
+                deepPair = SelectShortcutPairs(nNodes, commRange, /*minBaseHops=*/17, /*nPairs=*/1);
+            }
 
             // t=100s (settle+5+15): 5 same-branch (intra-cluster) pairs.
-            Simulator::Schedule(Seconds(15.0), [b0, proto, hopByHop, dstAddrOf,
+            Simulator::Schedule(Seconds(15.0), [nearbyPairs, proto, hopByHop, dstAddrOf,
                                                 startForegroundFlow]() {
-                for (std::size_t k = 0; k + 1 < b0.size() && k < 10; k += 2)
+                for (const auto& pr : nearbyPairs)
                 {
-                    Ipv6Address dst = dstAddrOf(b0[k + 1]);
+                    Ipv6Address dst = dstAddrOf(pr.second);
                     if (dst.IsAny())
                     {
                         continue;
                     }
-                    TriggerAndTrackDiscovery(b0[k], dst, proto, hopByHop, 10.0);
-                    Simulator::Schedule(Seconds(4.0), [k, b0, dst, startForegroundFlow]() {
-                        startForegroundFlow(b0[k], dst, 0.0, 20.0, 1.0, 15);
+                    TriggerAndTrackDiscovery(pr.first, dst, proto, hopByHop, 10.0);
+                    Simulator::Schedule(Seconds(4.0), [pr, dst, startForegroundFlow]() {
+                        startForegroundFlow(pr.first, dst, 0.0, 20.0, 1.0, 15);
                     });
                 }
             });
             // t=130s (settle+5+45): 5 cross-branch pairs (Branch0<->Branch1 shortcut).
-            Simulator::Schedule(Seconds(45.0), [b0, b1, proto, hopByHop, dstAddrOf,
+            Simulator::Schedule(Seconds(45.0), [shortcutPairs, proto, hopByHop, dstAddrOf,
                                                 startForegroundFlow]() {
-                for (std::size_t k = 0; k < b0.size() && k < b1.size() && k < 5; ++k)
+                for (const auto& pr : shortcutPairs)
                 {
-                    Ipv6Address dst = dstAddrOf(b1[k]);
+                    Ipv6Address dst = dstAddrOf(pr.second);
                     if (dst.IsAny())
                     {
                         continue;
                     }
-                    TriggerAndTrackDiscovery(b0[k], dst, proto, hopByHop, 10.0);
-                    Simulator::Schedule(Seconds(4.0), [k, b0, dst, startForegroundFlow]() {
-                        startForegroundFlow(b0[k], dst, 0.0, 20.0, 1.0, 15);
+                    TriggerAndTrackDiscovery(pr.first, dst, proto, hopByHop, 10.0);
+                    Simulator::Schedule(Seconds(4.0), [pr, dst, startForegroundFlow]() {
+                        startForegroundFlow(pr.first, dst, 0.0, 20.0, 1.0, 15);
                     });
                 }
             });
-            // t=160s (settle+5+75): fallback test -- Branch0<->Branch2 deep pair,
-            // physically beyond default P2pMaxRank/AodvRankLimit (=8) via any temp-DAG
-            // path (depth6+depth6=12 hops), so discovery must fail and the data must
-            // still arrive via the Base-RPL root-traversed path.
-            if (!b0Deep.empty() && !b2Deep.empty())
+            // t=160s (settle+5+75): fallback test -- deep pair physically beyond
+            // default P2pMaxRank/AodvRankLimit (=8) via any temp-DAG path, so
+            // discovery must fail and the data must still arrive via the
+            // Base-RPL root-traversed path.
+            if (!deepPair.empty())
             {
-                Simulator::Schedule(Seconds(75.0), [b0Deep, b2Deep, proto, hopByHop, dstAddrOf,
+                Simulator::Schedule(Seconds(75.0), [deepPair, proto, hopByHop, dstAddrOf,
                                                     startForegroundFlow]() {
-                    Ipv6Address dst = dstAddrOf(b2Deep[0]);
+                    Ipv6Address dst = dstAddrOf(deepPair[0].second);
                     if (!dst.IsAny())
                     {
-                        TriggerAndTrackDiscovery(b0Deep[0], dst, proto, hopByHop, 10.0);
-                        startForegroundFlow(b0Deep[0], dst, 11.0, 30.0, 1.0, 18);
+                        TriggerAndTrackDiscovery(deepPair[0].first, dst, proto, hopByHop, 10.0);
+                        startForegroundFlow(deepPair[0].first, dst, 11.0, 30.0, 1.0, 18);
                     }
                 });
             }
@@ -1153,23 +1408,37 @@ main(int argc, char** argv)
         else if (scenario == 5)
         {
             // ---- Scenario 5 (RPL x AODV-RPL mixed) ----
-            std::vector<uint32_t> b0 = BranchNodes(0, 4);
-            std::vector<uint32_t> b1 = BranchNodes(1, 4);
-            // t=110s (settle+5+25): 10-pair high-frequency burst (10 pkt/s).
-            Simulator::Schedule(Seconds(25.0), [b0, b1, proto, hopByHop, dstAddrOf,
-                                                startForegroundFlow]() {
+            // Cluster: original branch/tier selection. Grid/Random (C-6):
+            // generic shortcut pairs.
+            std::vector<std::pair<uint32_t, uint32_t>> pairs5;
+            if (topology == "cluster")
+            {
+                std::vector<uint32_t> b0 = BranchNodes(0, 4);
+                std::vector<uint32_t> b1 = BranchNodes(1, 4);
                 for (std::size_t k = 0; k < b0.size() && k < b1.size() && k < 10; ++k)
                 {
-                    Ipv6Address dst = dstAddrOf(b1[k % b1.size()]);
+                    pairs5.emplace_back(b0[k], b1[k % b1.size()]);
+                }
+            }
+            else
+            {
+                pairs5 = SelectShortcutPairs(nNodes, commRange, /*minBaseHops=*/8, /*nPairs=*/10);
+            }
+            // t=110s (settle+5+25): 10-pair high-frequency burst (10 pkt/s).
+            Simulator::Schedule(Seconds(25.0), [pairs5, proto, hopByHop, dstAddrOf,
+                                                startForegroundFlow]() {
+                for (const auto& pr : pairs5)
+                {
+                    Ipv6Address dst = dstAddrOf(pr.second);
                     if (dst.IsAny())
                     {
                         continue;
                     }
-                    TriggerAndTrackDiscovery(b0[k], dst, proto, hopByHop, 10.0);
+                    TriggerAndTrackDiscovery(pr.first, dst, proto, hopByHop, 10.0);
                     // Runs well past a short --pathLifetime, exercising the seamless
                     // fallback at t~170s (spec) once the AODV route expires.
-                    Simulator::Schedule(Seconds(4.0), [k, b0, dst, startForegroundFlow]() {
-                        startForegroundFlow(b0[k], dst, 0.0, 90.0, 0.1, 900);
+                    Simulator::Schedule(Seconds(4.0), [pr, dst, startForegroundFlow]() {
+                        startForegroundFlow(pr.first, dst, 0.0, 90.0, 0.1, 900);
                     });
                 }
             });
@@ -1178,20 +1447,34 @@ main(int argc, char** argv)
         {
             // ---- Scenario 6 (comparison): same matrix as Scenario 4/5, protocol
             // forced by --reactiveProtocol so the wrapper can run it twice.
-            std::vector<uint32_t> b0 = BranchNodes(0, 4);
-            std::vector<uint32_t> b1 = BranchNodes(1, 4);
-            Simulator::Schedule(Seconds(20.0), [b0, b1, proto, hopByHop, dstAddrOf,
-                                                startForegroundFlow]() {
+            // Cluster: original branch/tier selection. Grid/Random (C-6):
+            // generic shortcut pairs.
+            std::vector<std::pair<uint32_t, uint32_t>> pairs6;
+            if (topology == "cluster")
+            {
+                std::vector<uint32_t> b0 = BranchNodes(0, 4);
+                std::vector<uint32_t> b1 = BranchNodes(1, 4);
                 for (std::size_t k = 0; k < b0.size() && k < b1.size() && k < 8; ++k)
                 {
-                    Ipv6Address dst = dstAddrOf(b1[k]);
+                    pairs6.emplace_back(b0[k], b1[k]);
+                }
+            }
+            else
+            {
+                pairs6 = SelectShortcutPairs(nNodes, commRange, /*minBaseHops=*/8, /*nPairs=*/8);
+            }
+            Simulator::Schedule(Seconds(20.0), [pairs6, proto, hopByHop, dstAddrOf,
+                                                startForegroundFlow]() {
+                for (const auto& pr : pairs6)
+                {
+                    Ipv6Address dst = dstAddrOf(pr.second);
                     if (dst.IsAny())
                     {
                         continue;
                     }
-                    TriggerAndTrackDiscovery(b0[k], dst, proto, hopByHop, 10.0);
-                    Simulator::Schedule(Seconds(4.0), [k, b0, dst, startForegroundFlow]() {
-                        startForegroundFlow(b0[k], dst, 0.0, 25.0, 1.0, 20);
+                    TriggerAndTrackDiscovery(pr.first, dst, proto, hopByHop, 10.0);
+                    Simulator::Schedule(Seconds(4.0), [pr, dst, startForegroundFlow]() {
+                        startForegroundFlow(pr.first, dst, 0.0, 25.0, 1.0, 20);
                     });
                 }
             });
@@ -1436,7 +1719,9 @@ main(int argc, char** argv)
                "discoveryAttempts,discoverySuccess,fallbackSuccessRate,loopCount,"
                "maxDownwardRoutesNonRoot,maxDownwardRoutesRoot,maxP2pRoutes,maxAodvRoutes,"
                "controlBytes,dataBytes,dataPacketsRx,dataPacketsSent,dioIntervalMinMs,"
-               "dioIntervalDoublings,dioRedundancy\n";
+               "dioIntervalDoublings,dioRedundancy,rngRun,p2pDioIntervalMinMs,"
+               "p2pDioIntervalDoublings,aodvDioIntervalMinMs,aodvDioIntervalDoublings,"
+               "p2pDroAckRequested,linkAsymmetry\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -1449,7 +1734,10 @@ main(int argc, char** argv)
         << g_maxDownwardRoutesNonRoot << "," << g_maxDownwardRoutesRoot << "," << g_maxP2pRoutes
         << "," << g_maxAodvRoutes << "," << g_controlBytes << "," << g_dataBytes << ","
         << g_dataPacketsRx << "," << g_dataPacketsSent << "," << dioIntervalMinMs << ","
-        << dioIntervalDoublings << "," << dioRedundancy << "\n";
+        << dioIntervalDoublings << "," << dioRedundancy << "," << RngSeedManager::GetRun() << ","
+        << p2pDioIntervalMinMs << "," << p2pDioIntervalDoublings << "," << aodvDioIntervalMinMs
+        << "," << aodvDioIntervalDoublings << "," << (p2pDroAckRequested ? 1 : 0) << ","
+        << linkAsymmetry << "\n";
     csv.close();
 
     //

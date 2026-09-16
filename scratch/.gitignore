@@ -12,3 +12,8 @@
 !rpl-large-scale-system-test.cc
 !evaluate_test_results.py
 !system-test-run-all.sh
+
+# Comparative evaluation plan (P2P-RPL vs AODV-RPL): parallel runner and
+# per-study job-list generator, evaluation-plan items C-4/C-6.
+!system-test-parallel-run.sh
+!generate-study-jobs.py
