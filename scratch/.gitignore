@@ -23,3 +23,10 @@
 # do not silently edit its test logic once Study A-F data exists.
 !analyze-study-results.py
 !requirements-analysis.txt
+
+# Post-hoc / exploratory follow-ups to specific H-tests, run against real
+# Study A-F data and kept separate from the frozen script above (plan
+# section 7.3: post-hoc changes are disclosed, not merged into the frozen
+# test logic).
+!analyze-h3-topology-exploratory.py
+!analyze-h7-bgpdr-exploratory.py
