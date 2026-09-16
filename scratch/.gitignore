@@ -32,3 +32,8 @@
 !analyze-h7-bgpdr-exploratory.py
 !analyze-h4-h5-hopmode-exploratory.py
 !analyze-h9-studyd-exploratory.py
+
+# Replicates Baccelli/Philipp/Goyal, "The P2P-RPL Routing Protocol for IPv6
+# Sensor Networks: Testbed Experiments" (SoftCOM 2011), and extends it to
+# AODV-RPL under the same conditions.
+!p2p-rpl-paper-replication.cc
