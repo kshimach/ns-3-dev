@@ -68,9 +68,15 @@ def study_c():
 
 
 def study_d():
-    # protocol(2) x asymmetry(3) x rate(2) = 12 cells
+    # protocol(2) x asymmetry(3) x rate(2) = 12 cells.
+    # Calibrated empirically (5-run probe per level, scenario 6, aodvrpl,
+    # edgeSuccessRate=0.9): PDR falls off almost linearly from 87% (1.0) to
+    # 21% (0.5), so the plan's original 0.3 was already past the point of
+    # network collapse -- not informative for "does asymmetric routing pay
+    # off", just "does everything break". 0.6 sits in the still-functioning
+    # part of that range (PDR ~30%, discovery success 24/40) instead.
     for proto, asym, rate in itertools.product(
-        ("p2prpl", "aodvrpl"), (1.0, 0.6, 0.3), (0.9, 0.7)
+        ("p2prpl", "aodvrpl"), (1.0, 0.8, 0.6), (0.9, 0.7)
     ):
         yield (
             f"--scenario=6 --reactiveProtocol={proto} --edgeSuccessRate={rate} "
