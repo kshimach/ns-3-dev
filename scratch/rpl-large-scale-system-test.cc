@@ -1721,7 +1721,7 @@ main(int argc, char** argv)
                "controlBytes,dataBytes,dataPacketsRx,dataPacketsSent,dioIntervalMinMs,"
                "dioIntervalDoublings,dioRedundancy,rngRun,p2pDioIntervalMinMs,"
                "p2pDioIntervalDoublings,aodvDioIntervalMinMs,aodvDioIntervalDoublings,"
-               "p2pDroAckRequested,linkAsymmetry\n";
+               "p2pDroAckRequested,linkAsymmetry,aodvForceAsymmetric\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -1737,7 +1737,7 @@ main(int argc, char** argv)
         << dioIntervalDoublings << "," << dioRedundancy << "," << RngSeedManager::GetRun() << ","
         << p2pDioIntervalMinMs << "," << p2pDioIntervalDoublings << "," << aodvDioIntervalMinMs
         << "," << aodvDioIntervalDoublings << "," << (p2pDroAckRequested ? 1 : 0) << ","
-        << linkAsymmetry << "\n";
+        << linkAsymmetry << "," << (aodvForceAsymmetric ? 1 : 0) << "\n";
     csv.close();
 
     //
