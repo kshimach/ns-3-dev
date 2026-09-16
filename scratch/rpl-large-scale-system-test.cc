@@ -197,7 +197,13 @@ static uint64_t g_sumHopCount = 0;
 static uint16_t g_trafficPort = 9999;
 static const uint8_t kDefaultHopLimit = 64;
 
-// Separate stats for background (MP2P) and foreground (P2P/AODV) traffic
+// Separate stats for background (MP2P) and foreground (P2P/AODV) traffic.
+// g_bgPacketsSent is tracked separately from g_dataPacketsSent (which sums
+// both classes) so scenarios 4/5's combined `pdr` KPI -- which mixes steady
+// background telemetry with reactive foreground discovery flows into one
+// number -- can be cross-checked against a background-only PDR that is not
+// conflated with foreground flows (see H7 post-hoc analysis).
+static uint64_t g_bgPacketsSent = 0;
 static uint64_t g_bgRxPackets = 0;
 static uint64_t g_bgSumHops = 0;
 static uint64_t g_fgRxPackets = 0;
@@ -363,8 +369,14 @@ OnLocalDeliver(const Ipv6Header& header, Ptr<const Packet> packet, uint32_t inte
     uint32_t hops = (kDefaultHopLimit - header.GetHopLimit()) + 1;
     g_sumHopCount += hops;
 
-    // Distinguish background root traffic vs peer-to-peer traffic
-    if (header.GetDestination() == Ipv6Address("2001:1::1") ||
+    // Distinguish background root traffic vs peer-to-peer traffic. Compare
+    // against the root's *actual* SLAAC-assigned global address, not a
+    // hardcoded guess: "2001:1::1" is not what GetGlobalAddress() actually
+    // returns (EUI-64-derived interface identifier), so this check never
+    // matched and g_bgRxPackets was silently always 0 -- every background
+    // packet fell through to the foreground branch instead (discovered via
+    // bgPdr always reading exactly 0.0 in the H7 post-hoc analysis).
+    if ((!g_rootGlobalAddr.IsAny() && header.GetDestination() == g_rootGlobalAddr) ||
         header.GetDestination().IsLinkLocal())
     {
         g_bgRxPackets++;
@@ -1235,6 +1247,7 @@ main(int argc, char** argv)
                 app.Start(Seconds(startDelay));
                 app.Stop(Seconds(std::min<double>(simTime - settleTime - 5.0, 200.0)));
                 g_dataPacketsSent += maxPackets;
+                g_bgPacketsSent += maxPackets;
             }
         }
 
@@ -1551,6 +1564,12 @@ main(int argc, char** argv)
 
     double pdr =
         (g_dataPacketsSent > 0) ? (static_cast<double>(g_dataPacketsRx) / g_dataPacketsSent) : 0.0;
+    // Background-only PDR: g_bgRxPackets/g_bgPacketsSent, isolated from
+    // foreground reactive-discovery flows (scenario 4/5 mix both into the
+    // single `pdr` above; see the H7 post-hoc note at its declaration).
+    double bgPdr = (g_bgPacketsSent > 0)
+                       ? (static_cast<double>(g_bgRxPackets) / g_bgPacketsSent)
+                       : -1.0;
     double avgDelayMs = (g_dataPacketsRx > 0) ? (g_sumDelayUs / 1000.0 / g_dataPacketsRx) : 0.0;
     double avgHops =
         (g_dataPacketsRx > 0) ? (static_cast<double>(g_sumHopCount) / g_dataPacketsRx) : 0.0;
@@ -1721,7 +1740,7 @@ main(int argc, char** argv)
                "controlBytes,dataBytes,dataPacketsRx,dataPacketsSent,dioIntervalMinMs,"
                "dioIntervalDoublings,dioRedundancy,rngRun,p2pDioIntervalMinMs,"
                "p2pDioIntervalDoublings,aodvDioIntervalMinMs,aodvDioIntervalDoublings,"
-               "p2pDroAckRequested,linkAsymmetry,aodvForceAsymmetric\n";
+               "p2pDroAckRequested,linkAsymmetry,aodvForceAsymmetric,bgPdr\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -1737,7 +1756,7 @@ main(int argc, char** argv)
         << dioIntervalDoublings << "," << dioRedundancy << "," << RngSeedManager::GetRun() << ","
         << p2pDioIntervalMinMs << "," << p2pDioIntervalDoublings << "," << aodvDioIntervalMinMs
         << "," << aodvDioIntervalDoublings << "," << (p2pDroAckRequested ? 1 : 0) << ","
-        << linkAsymmetry << "," << (aodvForceAsymmetric ? 1 : 0) << "\n";
+        << linkAsymmetry << "," << (aodvForceAsymmetric ? 1 : 0) << "," << bgPdr << "\n";
     csv.close();
 
     //
