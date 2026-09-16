@@ -17,3 +17,9 @@
 # per-study job-list generator, evaluation-plan items C-4/C-6.
 !system-test-parallel-run.sh
 !generate-study-jobs.py
+
+# Comparative evaluation plan: pre-registered analysis script (Phase 2 /
+# Gate 2) and its Python dependencies. Frozen against pilot data only --
+# do not silently edit its test logic once Study A-F data exists.
+!analyze-study-results.py
+!requirements-analysis.txt

@@ -1,0 +1,7 @@
+# Dependencies for scratch/analyze-study-results.py only -- not part of the
+# ns-3/contrib-rpl build itself. Install into a throwaway venv:
+#   python3 -m venv .analysis-venv && .analysis-venv/bin/pip install -r scratch/requirements-analysis.txt
+numpy==2.5.3
+scipy==1.18.1
+statsmodels==0.15.0
+pandas==3.0.5
