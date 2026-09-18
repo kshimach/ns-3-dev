@@ -18,6 +18,7 @@ Factors (scratch/rpl-large-scale-system-test.cc, --link=lrwpan):
 
 Usage:
     <venv>/bin/python3 scratch/analyze-tier2-lrwpan.py --csv <tier2-results.csv>
+    <venv>/bin/python3 scratch/analyze-tier2-lrwpan.py --csv <sysbias.csv> --factor lrAsymDb
 """
 import argparse
 
@@ -45,25 +46,30 @@ def bootstrap_ratio_ci(numer, denom, n_boot=10000):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
+    ap.add_argument("--factor", default="lrNodePenaltySigmaDb",
+                    choices=["lrNodePenaltySigmaDb", "lrAsymDb"],
+                    help="which asymmetry knob was swept: per-receiver random penalty (default) "
+                         "or the systematic toward-root bias")
     args = ap.parse_args()
+    factor = args.factor
     df = pd.read_csv(args.csv)
     assert (df.link == "lrwpan").all(), "this script analyses --link=lrwpan runs only"
 
     df["macDropRate"] = df.macTxDrops / (df.macTxOk + df.macTxDrops).clip(lower=1)
-    pens = sorted(df.lrNodePenaltySigmaDb.unique())
+    pens = sorted(df[factor].unique())
     margins = sorted(df.lrMarginDb.unique())
 
     print("=" * 96)
     print(f"Tier 2 (lr-wpan + 6LoWPAN) P2P-RPL vs AODV-RPL   rows={len(df)}   "
-          f"nNodes={sorted(df.nNodes.unique())}  topology={sorted(df.topology.unique())}")
+          f"nNodes={sorted(df.nNodes.unique())}  topology={sorted(df.topology.unique())}  factor={factor}")
     print("=" * 96)
 
     def cell(proto, pen, mg):
-        return df[(df.reactiveProtocol == proto) & (df.lrNodePenaltySigmaDb == pen) &
+        return df[(df.reactiveProtocol == proto) & (df[factor] == pen) &
                   (df.lrMarginDb == mg)]
 
     print("\n--- Discovery success rate (pooled attempts), gap = P2P - AODV, 95% CI ---")
-    print(f"{'margin':>6} {'penSigma':>8} | {'P2P':>7} {'AODV':>7} | {'gap (pt)':>9}  95% CI")
+    print(f"{'margin':>6} {'level':>8} | {'P2P':>7} {'AODV':>7} | {'gap (pt)':>9}  95% CI")
     for mg in margins:
         for pen in pens:
             p, a = cell("p2prpl", pen, mg), cell("aodvrpl", pen, mg)
@@ -73,16 +79,16 @@ def main():
             print(f"{mg:6.0f} {pen:8.0f} | {100*s1/n1:6.1f}% {100*s2/n2:6.1f}% | "
                   f"{100*(s1/n1-s2/n2):+8.1f}  [{100*lo:+.1f}, {100*hi:+.1f}]")
 
-    print("\n--- Binomial GLM (quasi-binomial SE): success ~ protocol * penalty (+ margin) ---")
+    print(f"\n--- Binomial GLM (quasi-binomial SE): success ~ protocol * {factor} (+ margin) ---")
     d = df[df.discoveryAttempts > 0].copy()
     d["fail"] = d.discoveryAttempts - d.discoverySuccess
-    m = smf.glm("discoverySuccess + fail ~ C(reactiveProtocol) * lrNodePenaltySigmaDb + lrMarginDb",
+    m = smf.glm(f"discoverySuccess + fail ~ C(reactiveProtocol) * {factor} + lrMarginDb",
                 data=d, family=sm.families.Binomial()).fit(scale="X2")
     for term in m.params.index:
         print(f"  {term:58s} coef={m.params[term]:+.4f}  p={m.pvalues[term]:.4g}")
 
     print("\n--- Control cost: IP-layer control bytes and on-air PHY bytes, ratio AODV/P2P ---")
-    print(f"{'margin':>6} {'penSigma':>8} | {'IP ctrl ratio (95% CI)':>26} | {'PHY air ratio (95% CI)':>26}")
+    print(f"{'margin':>6} {'level':>8} | {'IP ctrl ratio (95% CI)':>26} | {'PHY air ratio (95% CI)':>26}")
     for mg in margins:
         for pen in pens:
             p, a = cell("p2prpl", pen, mg), cell("aodvrpl", pen, mg)
@@ -92,7 +98,7 @@ def main():
                   f"{r2[0]:6.2f} [{r2[1]:.2f},{r2[2]:.2f}]")
 
     print("\n--- MAC-layer frame abandonment rate and background PDR (means) ---")
-    print(f"{'margin':>6} {'penSigma':>8} | {'MAC drop%  P2P':>14} {'AODV':>7} | {'bgPDR%  P2P':>12} {'AODV':>7}")
+    print(f"{'margin':>6} {'level':>8} | {'MAC drop%  P2P':>14} {'AODV':>7} | {'bgPDR%  P2P':>12} {'AODV':>7}")
     for mg in margins:
         for pen in pens:
             p, a = cell("p2prpl", pen, mg), cell("aodvrpl", pen, mg)
@@ -100,7 +106,7 @@ def main():
                   f"{100*p.bgPdr.mean():12.1f} {100*a.bgPdr.mean():7.1f}")
 
     print("\n--- Discovery latency (median of per-run means, ms; successful runs only) ---")
-    print(f"{'margin':>6} {'penSigma':>8} | {'P2P':>8} {'AODV':>8}")
+    print(f"{'margin':>6} {'level':>8} | {'P2P':>8} {'AODV':>8}")
     for mg in margins:
         for pen in pens:
             p, a = cell("p2prpl", pen, mg), cell("aodvrpl", pen, mg)
