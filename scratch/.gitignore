@@ -37,3 +37,9 @@
 # Sensor Networks: Testbed Experiments" (SoftCOM 2011), and extends it to
 # AODV-RPL under the same conditions.
 !p2p-rpl-paper-replication.cc
+
+# Tier 2 (--link=lrwpan: IEEE 802.15.4 + 6LoWPAN) support for the large-scale
+# harness: the two-node link probe used to calibrate --lrMarginDb, and the
+# P2P-RPL vs AODV-RPL analysis for that link layer.
+!lrwpan-link-probe.cc
+!analyze-tier2-lrwpan.py

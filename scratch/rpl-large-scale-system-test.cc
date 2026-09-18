@@ -5,9 +5,22 @@
  *
  * Large-Scale System Test Suite for RPL, P2P-RPL, and AODV-RPL (~100 nodes).
  * Implements the 6 scenarios and quantitative KPIs of
- * rpl_large_scale_test_specification.md section 5.1 (Tier 1 / SimpleNetDevice
- * + UDGM only -- see design-constraints.md for the Tier 2 lr-wpan/6LoWPAN
- * deferral).
+ * rpl_large_scale_test_specification.md section 5.1.
+ *
+ * Two link layers, chosen with --link:
+ *   simple (default, "Tier 1"): SimpleNetDevice + UdgmChannel -- a
+ *     distance-only Bernoulli loss model with no MAC (no CSMA/CA, ACK,
+ *     retransmission, collision, fragmentation, or transmission time). Every
+ *     result produced before --link existed used this, and it is unchanged.
+ *   lrwpan ("Tier 2"): ns-3 lr-wpan (IEEE 802.15.4: CSMA/CA, MAC ACK + 3
+ *     retransmissions, SINR-based frame error, collisions/hidden terminals)
+ *     under 6LoWPAN (IPHC compression, fragmentation), LogDistance path loss
+ *     with optional static shadowing and per-receiver noise penalties. Not
+ *     Wi-SUN (no FSK PHY, no frequency hopping), and a single 250 kb/s
+ *     channel, so it saturates at a few tens of nodes -- see
+ *     scratch/lrwpan-link-probe.cc for how --lrMarginDb maps to frame
+ *     delivery, and scratch/analyze-tier2-lrwpan.py for the P2P-RPL vs
+ *     AODV-RPL comparison run on it.
  *
  * Supports Scenario 1 (RPL), 2 (P2P), 3 (AODV), 4 (RPL x P2P), 5 (RPL x
  * AODV), 6 (Compare).
@@ -16,9 +29,13 @@
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
+#include "ns3/lr-wpan-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
+#include "ns3/propagation-module.h"
 #include "ns3/rpl-module.h"
+#include "ns3/sixlowpan-module.h"
+#include "ns3/spectrum-module.h"
 
 #include <algorithm>
 #include <fstream>
@@ -26,6 +43,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <set>
 #include <vector>
@@ -49,6 +67,11 @@ constexpr int64_t kChannelStream = 30;
 constexpr int64_t kTrafficJitterStream = 40;
 constexpr int64_t kPairSelectionStream = 41; // SelectShortcutPairs()'s candidate shuffle
 constexpr int64_t kRplStreamBase = 1000;     // RplHelper::AssignStreams() base
+// --link=lrwpan only (the simple/UDGM path never touches these):
+constexpr int64_t kNodePenaltyStream = 42;      // per-receiver penalty draws
+constexpr int64_t kShadowStream = 43;           // per-link static shadowing draws
+constexpr int64_t kLrWpanStreamBase = 2000;     // LrWpanHelper::AssignStreams() base
+constexpr int64_t kSixLowPanStreamBase = 3000;  // SixLowPanHelper::AssignStreams() base
 
 /**
  * @brief UDGM loss model: quadratic loss with Euclidean distance, with an
@@ -132,6 +155,153 @@ class UdgmChannel : public SimpleChannel
     double m_asymmetry{1.0};       // reverse-direction multiplier (1.0 = symmetric)
     Ptr<UniformRandomVariable> m_rng;
 };
+
+/**
+ * @brief --link=lrwpan only. Extra dB offsets on top of LogDistance, so the
+ *        physical channel can be made asymmetric the way real ones are
+ *        (the SINR seen at one end is degraded, the other end's is not),
+ *        rather than through UdgmChannel's probability multiplier.
+ *
+ *        - asymDb: transmissions from a higher node id to a lower one lose
+ *          this many extra dB (same direction convention as linkAsymmetry:
+ *          root/upstream nodes are created first, so this is the
+ *          "toward-root" direction).
+ *        - per-receiver penalty (dB): each node's own receive chain is
+ *          degraded by a fixed amount, i.e. a higher noise floor or worse
+ *          receive sensitivity at that node. A link A<->B then loses
+ *          penalty[B] one way and penalty[A] the other, with a random
+ *          orientation per link -- which is what receiver-side noise
+ *          differences actually look like, unlike a global "uplink is
+ *          worse" bias.
+ */
+class NodeOffsetLossModel : public PropagationLossModel
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::HarnessNodeOffsetLossModel")
+                                .SetParent<PropagationLossModel>()
+                                .SetGroupName("Propagation");
+        return tid;
+    }
+
+    void SetAsymmetryDb(double db)
+    {
+        m_asymDb = db;
+    }
+
+    void SetNodePenaltiesDb(std::vector<double> penaltiesDb)
+    {
+        m_penaltyDb = std::move(penaltiesDb);
+    }
+
+    /// Static log-normal shadowing: one N(0, sigma^2) dB offset per
+    /// *unordered* node pair, drawn once up front, so a link keeps its
+    /// quality for the whole run and both directions share it (an obstacle
+    /// is reciprocal). Without it the deterministic LogDistance channel is
+    /// nearly binary (a ~3 dB cliff between "always" and "never" -- see
+    /// scratch/lrwpan-link-probe.cc), which leaves no partially-lossy links
+    /// for asymmetry to act on.
+    void SetShadowing(uint32_t nNodes, double sigmaDb, Ptr<NormalRandomVariable> nrv)
+    {
+        m_nNodes = nNodes;
+        m_shadowDb.assign(static_cast<std::size_t>(nNodes) * nNodes, 0.0);
+        for (uint32_t i = 0; i < nNodes; ++i)
+        {
+            for (uint32_t j = i + 1; j < nNodes; ++j)
+            {
+                double v = sigmaDb * nrv->GetValue();
+                m_shadowDb[static_cast<std::size_t>(i) * nNodes + j] = v;
+                m_shadowDb[static_cast<std::size_t>(j) * nNodes + i] = v;
+            }
+        }
+    }
+
+  private:
+    double DoCalcRxPower(double txPowerDbm,
+                         Ptr<MobilityModel> a,
+                         Ptr<MobilityModel> b) const override
+    {
+        Ptr<Node> txNode = a->GetObject<Node>();
+        Ptr<Node> rxNode = b->GetObject<Node>();
+        double rx = txPowerDbm;
+        if (txNode && rxNode)
+        {
+            uint32_t ti = txNode->GetId();
+            uint32_t ri = rxNode->GetId();
+            if (m_asymDb != 0.0 && ti > ri)
+            {
+                rx -= m_asymDb;
+            }
+            if (!m_shadowDb.empty() && ti < m_nNodes && ri < m_nNodes)
+            {
+                rx -= m_shadowDb[static_cast<std::size_t>(ti) * m_nNodes + ri];
+            }
+            if (ri < m_penaltyDb.size())
+            {
+                rx -= m_penaltyDb[ri];
+            }
+        }
+        return rx;
+    }
+
+    int64_t DoAssignStreams(int64_t) override
+    {
+        return 0;
+    }
+
+    double m_asymDb{0.0};
+    std::vector<double> m_penaltyDb;
+    uint32_t m_nNodes{0};
+    std::vector<double> m_shadowDb;
+};
+
+// --link=lrwpan air-interface counters (frames actually put on the air,
+// retries and ACKs included, and what the PHY/MAC gave up on) -- the
+// UDGM path has no equivalent, so these stay 0 there.
+static uint64_t g_phyTxFrames = 0;
+static uint64_t g_phyTxBytes = 0;
+static uint64_t g_ndPackets = 0;   // IPv6 neighbour discovery (RS/RA/NS/NA/redirect) sent, per hop
+static uint64_t g_ipTxPackets = 0; // every IPv6 packet handed to a device (forwards included)
+static std::map<int, uint64_t> g_ipDropByReason;   // Ipv6L3Protocol::DropReason -> count
+static std::map<int, uint64_t> g_sixDropByReason;  // SixLowPanNetDevice::DropReason -> count
+static std::map<std::string, std::pair<uint64_t, uint64_t>> g_ipSizeByKind; // kind -> (count, total bytes)
+static std::map<std::string, uint64_t> g_ipOver90ByKind; // packets whose IPv6 size > 90 B (likely to fragment)
+static uint64_t g_macTxOk = 0;    // unicast frames ACKed (broadcast frames never confirm)
+static uint64_t g_macTxDrops = 0; // frames abandoned: retries exhausted or CSMA/CA gave up
+static uint32_t g_payloadBytes = 512; // UDP payload of background/foreground flows
+static uint32_t g_bgIntervalS = 0;    // 0 = scenario default (5 s scenario 1, 10 s otherwise)
+
+static void
+OnPhyTxBegin(Ptr<const Packet> p)
+{
+    g_phyTxFrames++;
+    g_phyTxBytes += p->GetSize();
+}
+
+static void
+OnIpv6Drop(const Ipv6Header&, Ptr<const Packet>, Ipv6L3Protocol::DropReason reason, Ptr<Ipv6>, uint32_t)
+{
+    g_ipDropByReason[static_cast<int>(reason)]++;
+}
+
+static void
+OnSixLowPanDrop(SixLowPanNetDevice::DropReason reason, Ptr<const Packet>, Ptr<SixLowPanNetDevice>, uint32_t)
+{
+    g_sixDropByReason[static_cast<int>(reason)]++;
+}
+
+static void
+OnMacTxOk(Ptr<const Packet>)
+{
+    g_macTxOk++;
+}
+
+static void
+OnMacTxDrop(Ptr<const Packet>)
+{
+    g_macTxDrops++;
+}
 
 //
 // ===================== Topology C: Cluster/Branch geometry =====================
@@ -286,10 +456,36 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
     Ptr<Packet> copy = packet->Copy();
     Ipv6Header ipHeader;
     copy->RemoveHeader(ipHeader);
+    g_ipTxPackets++;
+    {
+        std::string kind = "other";
+        if (ipHeader.GetNextHeader() == Icmpv6L4Protocol::GetStaticProtocolNumber())
+        {
+            Icmpv6Header ih;
+            copy->PeekHeader(ih);
+            kind = (ih.GetType() == rpl::ICMPV6_RPL) ? ("rpl-code" + std::to_string(ih.GetCode()))
+                                                     : ("icmp" + std::to_string(ih.GetType()));
+        }
+        else
+        {
+            kind = "data/ext";
+        }
+        auto& e = g_ipSizeByKind[kind];
+        e.first++;
+        e.second += packet->GetSize();
+        if (packet->GetSize() > 90)
+        {
+            g_ipOver90ByKind[kind]++;
+        }
+    }
     if (ipHeader.GetNextHeader() == Icmpv6L4Protocol::GetStaticProtocolNumber())
     {
         Icmpv6Header icmpHeader;
         copy->PeekHeader(icmpHeader);
+        if (icmpHeader.GetType() >= 133 && icmpHeader.GetType() <= 137)
+        {
+            g_ndPackets++;
+        }
         if (icmpHeader.GetType() == rpl::ICMPV6_RPL)
         {
             g_controlBytes += packet->GetSize();
@@ -1025,6 +1221,31 @@ main(int argc, char** argv)
     // symmetric UdgmChannel exactly.
     double linkAsymmetry = 1.0;
 
+    // --link=lrwpan (Tier 2): IEEE 802.15.4 (ns-3 lr-wpan: CSMA/CA, MAC
+    // ACK + retransmission, SINR-based PER, collisions) + 6LoWPAN
+    // (IPHC compression, fragmentation) instead of the default Tier 1
+    // SimpleNetDevice + UdgmChannel. The default ("simple") reproduces every
+    // earlier result exactly.
+    std::string link = "simple"; // "simple" or "lrwpan"
+    // LogDistance is parameterised by *where the range is*, not by raw
+    // reference loss: the mean received power at lrRangeM (default =
+    // commRange, so the grid/random/cluster geometries built for a 50 m
+    // range keep their intended connectivity) sits lrMarginDb above the
+    // PHY receive sensitivity. Lower margin = a harsher channel.
+    double lrRangeM = -1.0;      // <0: use commRange
+    double lrMarginDb = 0.0;
+    double lrExponent = 3.0;     // LogDistance path-loss exponent (ns-3 default)
+    // Extra dB penalties (see NodeOffsetLossModel); 0 = a reciprocal channel.
+    double lrAsymDb = 0.0;
+    double lrNodePenaltySigmaDb = 0.0;
+    double lrShadowSigmaDb = 0.0; // static per-link log-normal shadowing (dB)
+    // Objective function. OF0 (hop count, the default and what every Tier 1
+    // result used) picks the farthest -- weakest -- neighbour as parent when
+    // links are physically lossy; MRHOF (RFC 6719, ETX from the PHY's LQI
+    // tag) is what a real lossy network runs, so Tier 2 studies use it.
+    std::string ocp = "of0"; // "of0" or "mrhof"
+    uint32_t payloadBytes = 512;
+
     CommandLine cmd(__FILE__);
     cmd.AddValue("scenario", "1:RPL, 2:P2P, 3:AODV, 4:MIX-P2P, 5:MIX-AODV, 6:CMP", scenario);
     cmd.AddValue("nNodes", "Number of nodes in total (Root + sensors)", nNodes);
@@ -1071,7 +1292,33 @@ main(int argc, char** argv)
                  "UdgmChannel reverse-direction (higher node id -> lower node id) delivery "
                  "probability multiplier; 1.0 = symmetric (default)",
                  linkAsymmetry);
+    cmd.AddValue("link", "simple (SimpleNetDevice+UDGM) or lrwpan (802.15.4 + 6LoWPAN)", link);
+    cmd.AddValue("lrRangeM", "lrwpan: distance whose mean rx power = sensitivity + lrMarginDb "
+                             "(<0: commRange)", lrRangeM);
+    cmd.AddValue("lrMarginDb", "lrwpan: link margin above receive sensitivity at lrRangeM (dB)",
+                 lrMarginDb);
+    cmd.AddValue("lrExponent", "lrwpan: LogDistance path-loss exponent", lrExponent);
+    cmd.AddValue("lrAsymDb", "lrwpan: extra loss (dB) for transmissions from a higher node id to "
+                             "a lower one", lrAsymDb);
+    cmd.AddValue("lrNodePenaltySigmaDb",
+                 "lrwpan: per-receiver penalty ~ |N(0,sigma)| dB (receiver-side noise/"
+                 "sensitivity differences); 0 = none", lrNodePenaltySigmaDb);
+    cmd.AddValue("lrShadowSigmaDb",
+                 "lrwpan: static per-link (reciprocal) log-normal shadowing sigma in dB; 0 = "
+                 "deterministic LogDistance", lrShadowSigmaDb);
+    cmd.AddValue("ocp", "objective function: of0 (hop count) or mrhof (ETX; needs --link=lrwpan "
+                        "for a meaningful link metric)", ocp);
+    cmd.AddValue("payloadBytes", "UDP payload bytes of background/foreground flows", payloadBytes);
+    cmd.AddValue("bgIntervalS",
+                 "background telemetry interval in seconds (0 = scenario default)", g_bgIntervalS);
     cmd.Parse(argc, argv);
+    g_payloadBytes = payloadBytes;
+    NS_ABORT_MSG_IF(link != "simple" && link != "lrwpan", "--link must be simple or lrwpan");
+    const bool useLrWpan = (link == "lrwpan");
+    if (lrRangeM < 0.0)
+    {
+        lrRangeM = commRange;
+    }
 
     std::string proto = !reactiveProtocol.empty()
                             ? reactiveProtocol
@@ -1108,18 +1355,97 @@ main(int argc, char** argv)
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(g_nodes);
 
-    // L2: SimpleNetDevice over UdgmChannel
-    Ptr<UdgmChannel> channel = CreateObject<UdgmChannel>();
-    channel->SetParameters(commRange, edgeSuccessRate);
-    channel->SetAsymmetry(linkAsymmetry);
-    NetDeviceContainer devices;
-    for (uint32_t i = 0; i < nNodes; ++i)
+    // L2: Tier 1 = SimpleNetDevice over UdgmChannel; Tier 2 (--link=lrwpan) =
+    // lr-wpan devices here, with the 6LoWPAN layer added once the IP stack
+    // is installed (below), the same order rpl-6lowpan-simple.cc uses.
+    NetDeviceContainer devices;        // what IPv6 sits on
+    NetDeviceContainer lrwpanDevices;  // --link=lrwpan only
+    // Constructed only for --link=lrwpan: ~LrWpanHelper() calls
+    // m_channel->Dispose() without a null check, and the channel is built
+    // lazily in Install(), so a helper that never installed anything aborts
+    // the process at exit (after the CSV row is already written, which made
+    // every default-mode run look like a crash to the parallel runner).
+    std::unique_ptr<LrWpanHelper> lrWpanHelperOwner;
+    if (!useLrWpan)
     {
-        Ptr<SimpleNetDevice> dev = CreateObject<SimpleNetDevice>();
-        dev->SetAddress(Mac48Address::Allocate());
-        g_nodes.Get(i)->AddDevice(dev);
-        dev->SetChannel(channel);
-        devices.Add(dev);
+        Ptr<UdgmChannel> channel = CreateObject<UdgmChannel>();
+        channel->SetParameters(commRange, edgeSuccessRate);
+        channel->SetAsymmetry(linkAsymmetry);
+        for (uint32_t i = 0; i < nNodes; ++i)
+        {
+            Ptr<SimpleNetDevice> dev = CreateObject<SimpleNetDevice>();
+            dev->SetAddress(Mac48Address::Allocate());
+            g_nodes.Get(i)->AddDevice(dev);
+            dev->SetChannel(channel);
+            devices.Add(dev);
+        }
+    }
+    else
+    {
+        lrWpanHelperOwner = std::make_unique<LrWpanHelper>();
+        LrWpanHelper& lrWpanHelper = *lrWpanHelperOwner;
+        // LogDistance: rx(d) = tx - refLoss - 10*n*log10(d/1m). Solve refLoss
+        // so that rx(lrRangeM) = sensitivity + margin, with the PHY's default
+        // 0 dBm transmit power and -106.58 dBm sensitivity.
+        constexpr double kTxPowerDbm = 0.0;
+        constexpr double kSensitivityDbm = -106.58;
+        double refLossDb =
+            kTxPowerDbm - (kSensitivityDbm + lrMarginDb) - 10.0 * lrExponent * std::log10(lrRangeM);
+        lrWpanHelper.SetPropagationDelayModel("ns3::ConstantSpeedPropagationDelayModel");
+        lrWpanHelper.AddPropagationLossModel("ns3::LogDistancePropagationLossModel",
+                                             "Exponent",
+                                             DoubleValue(lrExponent),
+                                             "ReferenceDistance",
+                                             DoubleValue(1.0),
+                                             "ReferenceLoss",
+                                             DoubleValue(refLossDb));
+        lrwpanDevices = lrWpanHelper.Install(g_nodes);
+        // The helper builds its SpectrumChannel lazily inside Install(), so
+        // GetChannel() is null before this point -- the offset model has to
+        // be attached afterwards (AddPropagationLossModel() prepends it to
+        // the chain, which is fine: the offsets are plain additive dB).
+        if (lrAsymDb != 0.0 || lrNodePenaltySigmaDb > 0.0 || lrShadowSigmaDb > 0.0)
+        {
+            Ptr<NodeOffsetLossModel> offsets = CreateObject<NodeOffsetLossModel>();
+            offsets->SetAsymmetryDb(lrAsymDb);
+            if (lrShadowSigmaDb > 0.0)
+            {
+                Ptr<NormalRandomVariable> shadowRv = CreateObject<NormalRandomVariable>();
+                shadowRv->SetStream(kShadowStream);
+                shadowRv->SetAttribute("Mean", DoubleValue(0.0));
+                shadowRv->SetAttribute("Variance", DoubleValue(1.0));
+                offsets->SetShadowing(nNodes, lrShadowSigmaDb, shadowRv);
+            }
+            std::vector<double> penalties(nNodes, 0.0);
+            if (lrNodePenaltySigmaDb > 0.0)
+            {
+                Ptr<NormalRandomVariable> nrv = CreateObject<NormalRandomVariable>();
+                nrv->SetStream(kNodePenaltyStream);
+                nrv->SetAttribute("Mean", DoubleValue(0.0));
+                nrv->SetAttribute("Variance", DoubleValue(lrNodePenaltySigmaDb * lrNodePenaltySigmaDb));
+                for (uint32_t i = 1; i < nNodes; ++i) // the root keeps a clean receiver
+                {
+                    penalties[i] = std::fabs(nrv->GetValue());
+                }
+            }
+            offsets->SetNodePenaltiesDb(penalties);
+            lrWpanHelper.GetChannel()->AddPropagationLossModel(offsets);
+        }
+        lrWpanHelper.AssignStreams(lrwpanDevices, kLrWpanStreamBase);
+        lrWpanHelper.CreateAssociatedPan(lrwpanDevices, 1);
+        // Without an error model the PHY never turns SINR into frame loss
+        // (rpl-6lowpan-simple.cc's own comment): one shared LrWpanErrorModel
+        // is what makes distance, collisions and the asymmetry offsets above
+        // actually cost frames.
+        Ptr<lrwpan::LrWpanErrorModel> errorModel = CreateObject<lrwpan::LrWpanErrorModel>();
+        for (auto it = lrwpanDevices.Begin(); it != lrwpanDevices.End(); ++it)
+        {
+            Ptr<lrwpan::LrWpanNetDevice> d = DynamicCast<lrwpan::LrWpanNetDevice>(*it);
+            d->GetPhy()->SetErrorModel(errorModel);
+            d->GetPhy()->TraceConnectWithoutContext("PhyTxBegin", MakeCallback(&OnPhyTxBegin));
+            d->GetMac()->TraceConnectWithoutContext("MacTxOk", MakeCallback(&OnMacTxOk));
+            d->GetMac()->TraceConnectWithoutContext("MacTxDrop", MakeCallback(&OnMacTxDrop));
+        }
     }
 
     // L3: RPL Configuration
@@ -1131,6 +1457,11 @@ main(int argc, char** argv)
     else
     {
         rplHelper.Set("Mop", UintegerValue(rpl::RPL_MOP_STORING_NO_MULTICAST));
+    }
+    NS_ABORT_MSG_IF(ocp != "of0" && ocp != "mrhof", "--ocp must be of0 or mrhof");
+    if (ocp == "mrhof")
+    {
+        rplHelper.Set("Ocp", UintegerValue(rpl::RPL_OCP_MRHOF));
     }
     rplHelper.Set("DioIntervalMin", TimeValue(MilliSeconds(dioIntervalMinMs)));
     rplHelper.Set("DioIntervalDoublings", UintegerValue(dioIntervalDoublings));
@@ -1166,6 +1497,14 @@ main(int argc, char** argv)
     // headroom to the next reserved range).
     rplHelper.AssignStreams(g_nodes, kRplStreamBase);
 
+    if (useLrWpan)
+    {
+        // Route-over: IPv6 (and so RPL) sits on the 6LoWPAN devices.
+        SixLowPanHelper sixlowpan;
+        devices = sixlowpan.Install(lrwpanDevices);
+        sixlowpan.AssignStreams(devices, kSixLowPanStreamBase);
+    }
+
     Ipv6AddressHelper ipv6;
     Ipv6InterfaceContainer interfaces = ipv6.AssignWithoutAddress(devices);
     for (uint32_t i = 0; i < nNodes; ++i)
@@ -1183,6 +1522,13 @@ main(int argc, char** argv)
     Config::ConnectWithoutContext(
         "/NodeList/*/$ns3::rpl::RplRoutingProtocol/RankErrorConfirmed",
         MakeCallback(&OnRankErrorConfirmed));
+    Config::ConnectWithoutContext("/NodeList/*/$ns3::Ipv6L3Protocol/Drop",
+                                  MakeCallback(&OnIpv6Drop));
+    if (useLrWpan)
+    {
+        Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::SixLowPanNetDevice/Drop",
+                                      MakeCallback(&OnSixLowPanDrop));
+    }
 
     g_lastJoined.assign(nNodes, false);
     g_lastRank.assign(nNodes, 0);
@@ -1226,6 +1572,18 @@ main(int argc, char** argv)
             // actually produces).
             uint32_t interval = (scenario == 1) ? 5 : 10;
             uint32_t maxPackets = (scenario == 1) ? 24 : 17;
+            if (g_bgIntervalS > 0)
+            {
+                // --bgIntervalS: a slower reporting rate (Tier 2 -- one
+                // packet/10 s from every node is far heavier than any real
+                // metering network puts on a 250 kb/s channel). Keep the same
+                // window the defaults above fill and only send as many packets
+                // as fit in it (worst-case 5 s start jitter), so the
+                // "packets sent" bookkeeping below stays exact.
+                double window = std::min<double>(simTime - settleTime - 5.0, 200.0) - 5.0;
+                interval = g_bgIntervalS;
+                maxPackets = std::max<uint32_t>(1, static_cast<uint32_t>(window / interval));
+            }
             // One shared RNG on a fixed stream (evaluation-plan item C-5),
             // rather than one auto-streamed RandomVariableStream per node:
             // the previous per-iteration CreateObject<>() consumed nNodes-1
@@ -1240,7 +1598,7 @@ main(int argc, char** argv)
             {
                 UdpClientHelper client(g_rootGlobalAddr, g_trafficPort);
                 client.SetAttribute("Interval", TimeValue(Seconds(interval)));
-                client.SetAttribute("PacketSize", UintegerValue(512));
+                client.SetAttribute("PacketSize", UintegerValue(g_payloadBytes));
                 client.SetAttribute("MaxPackets", UintegerValue(maxPackets));
                 ApplicationContainer app = client.Install(g_nodes.Get(i));
                 double startDelay = jit->GetValue(0.0, 5.0);
@@ -1255,7 +1613,7 @@ main(int argc, char** argv)
                                       double stopS, double intervalS, uint32_t maxPackets) {
             UdpClientHelper client(dst, g_trafficPort);
             client.SetAttribute("Interval", TimeValue(Seconds(intervalS)));
-            client.SetAttribute("PacketSize", UintegerValue(512));
+            client.SetAttribute("PacketSize", UintegerValue(g_payloadBytes));
             client.SetAttribute("MaxPackets", UintegerValue(maxPackets));
             ApplicationContainer app = client.Install(g_nodes.Get(srcIdx));
             app.Start(Seconds(startS));
@@ -1722,6 +2080,33 @@ main(int argc, char** argv)
               << "\n"
               << "===================================================================\n";
 
+    if (useLrWpan)
+    {
+        std::cout << " [lrwpan] PHY frames tx: " << g_phyTxFrames << " (" << g_phyTxBytes
+                  << " B), MAC unicast ok/dropped: " << g_macTxOk << "/" << g_macTxDrops
+                  << ", ND pkts: " << g_ndPackets << " of " << g_ipTxPackets << " IP tx\n";
+        std::cout << " [lrwpan] IPv6 drops by reason (1=ttl 2=no-route 3=if-down 4=route-err "
+                     "5=unk-proto 6=unk-opt 7=malformed 8=frag-timeout):";
+        for (const auto& kv : g_ipDropByReason)
+        {
+            std::cout << " " << kv.first << ":" << kv.second;
+        }
+        std::cout << "\n [lrwpan] IPv6 packets by kind (count, mean bytes, count>90B):\n";
+        for (const auto& kv : g_ipSizeByKind)
+        {
+            std::cout << "    " << kv.first << ": " << kv.second.first << ", "
+                      << kv.second.second / std::max<uint64_t>(1, kv.second.first) << " B, "
+                      << g_ipOver90ByKind[kv.first] << "\n";
+        }
+        std::cout << " [lrwpan] 6LoWPAN drops by reason (1=frag-timeout 2=frag-buf-full "
+                     "3=unk-ext 4=disallowed 5=stateful-decomp):";
+        for (const auto& kv : g_sixDropByReason)
+        {
+            std::cout << " " << kv.first << ":" << kv.second;
+        }
+        std::cout << "\n";
+    }
+
     // ---- KPI CSV (spec section 5.1) ----
     bool writeHeader = false;
     {
@@ -1740,7 +2125,9 @@ main(int argc, char** argv)
                "controlBytes,dataBytes,dataPacketsRx,dataPacketsSent,dioIntervalMinMs,"
                "dioIntervalDoublings,dioRedundancy,rngRun,p2pDioIntervalMinMs,"
                "p2pDioIntervalDoublings,aodvDioIntervalMinMs,aodvDioIntervalDoublings,"
-               "p2pDroAckRequested,linkAsymmetry,aodvForceAsymmetric,bgPdr\n";
+               "p2pDroAckRequested,linkAsymmetry,aodvForceAsymmetric,bgPdr,link,payloadBytes,"
+               "lrRangeM,lrMarginDb,lrAsymDb,lrNodePenaltySigmaDb,lrShadowSigmaDb,phyTxFrames,"
+               "phyTxBytes,macTxOk,macTxDrops,ndPackets,ipTxPackets,ocp\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -1756,7 +2143,11 @@ main(int argc, char** argv)
         << dioIntervalDoublings << "," << dioRedundancy << "," << RngSeedManager::GetRun() << ","
         << p2pDioIntervalMinMs << "," << p2pDioIntervalDoublings << "," << aodvDioIntervalMinMs
         << "," << aodvDioIntervalDoublings << "," << (p2pDroAckRequested ? 1 : 0) << ","
-        << linkAsymmetry << "," << (aodvForceAsymmetric ? 1 : 0) << "," << bgPdr << "\n";
+        << linkAsymmetry << "," << (aodvForceAsymmetric ? 1 : 0) << "," << bgPdr << "," << link
+        << "," << payloadBytes << "," << lrRangeM << "," << lrMarginDb << "," << lrAsymDb << ","
+        << lrNodePenaltySigmaDb << "," << lrShadowSigmaDb << "," << g_phyTxFrames << ","
+        << g_phyTxBytes << "," << g_macTxOk << "," << g_macTxDrops << "," << g_ndPackets << ","
+        << g_ipTxPackets << "," << ocp << "\n";
     csv.close();
 
     //
