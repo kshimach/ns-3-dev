@@ -48,3 +48,8 @@
 # counterfactual sweep runner and its analysis.
 !run-aodv-control-cost.sh
 !analyze-aodv-control-cost.py
+
+# Safety sweep deciding whether the AODV-RPL temporary-instance knobs can
+# become module defaults, and its analysis.
+!run-aodv-defaults-sweep.sh
+!analyze-aodv-defaults.py
