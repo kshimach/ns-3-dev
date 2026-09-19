@@ -335,6 +335,27 @@ static std::map<std::pair<uint8_t, Ipv6Address>, TempDodagStats> g_tempDodags;
 /// normally and the cost is simply a missing suppression rule.
 static std::vector<double> g_dioGapsByClass[DIO_CLASS_COUNT];
 
+// ---------------------------------------------------------------------------
+// 6LoWPAN fragmentation, by what was being carried
+// ---------------------------------------------------------------------------
+// P2P-RPL loses 20-30x more packets to fragment-reassembly timeout than
+// AODV-RPL does in the same scenario, and the obvious suspect is DIO size: a
+// P2P-RDO carries an Address Vector that grows with hop count (measured 124-
+// 128 B), while an H=1 RREQ-DIO's stays empty (a constant 112 B). An 802.15.4
+// frame holds 127 B, so the two sit on opposite sides of the point where
+// IPHC compression stops being enough -- and a fragmented *broadcast* has no
+// MAC retransmission to recover a lost piece with.
+//
+// SixLowPanNetDevice fires TxPre with the IPv6 packet and then Tx once per
+// fragment, synchronously, so remembering the class from TxPre attributes the
+// fragments that follow it. Index DIO_CLASS_COUNT is everything that is not a
+// DIO.
+static const int kSixClassCount = DIO_CLASS_COUNT + 1;
+static uint64_t g_sixTxPreByClass[kSixClassCount] = {};  //!< IPv6 packets handed to 6LoWPAN
+static uint64_t g_sixTxFragsByClass[kSixClassCount] = {}; //!< frames it produced from them
+static uint64_t g_sixRxPostByClass[kSixClassCount] = {};  //!< IPv6 packets reassembled at receivers
+static int g_lastSixClass = DIO_CLASS_COUNT;
+
 static void
 OnPhyTxBegin(Ptr<const Packet> p)
 {
@@ -562,6 +583,132 @@ RecordTc(const std::string& id, const std::string& name, bool applicable, bool p
     g_tcResults.push_back({id, name, applicable, passed, detail});
 }
 
+/// Step `copy` past any Hop-by-Hop / Routing / Destination extension headers
+/// and leave `nextHeader` holding the real one. Skipped by RFC 8200's own
+/// length rule rather than with Ipv6ExtensionHeader::RemoveHeader(), whose
+/// GetSerializedSize() is 2: that consumes only the two-byte prefix and
+/// leaves the iterator inside the option data, so anything read afterwards --
+/// an ICMPv6 type, say -- comes off the wrong offset. The misalignment is
+/// invisible if the walk is only used to test NextHeader, which is why it
+/// went unnoticed while that was all it was used for.
+///
+/// @param copy the packet, already past its IPv6 header; advanced in place
+/// @param nextHeader in: the IPv6 header's NextHeader; out: the real one
+/// @return false if the chain is truncated or malformed
+static bool
+SkipIpv6ExtensionHeaders(Ptr<Packet> copy, uint8_t& nextHeader)
+{
+    while (nextHeader == Ipv6Header::IPV6_EXT_HOP_BY_HOP ||
+          nextHeader == Ipv6Header::IPV6_EXT_ROUTING ||
+          nextHeader == Ipv6Header::IPV6_EXT_DESTINATION)
+    {
+        uint8_t prefix[2];
+        if (copy->CopyData(prefix, 2) < 2)
+        {
+            return false;
+        }
+        uint32_t extLen = (static_cast<uint32_t>(prefix[1]) + 1) * 8;
+        if (copy->GetSize() < extLen)
+        {
+            return false;
+        }
+        copy->RemoveAtStart(extLen);
+        nextHeader = prefix[0];
+    }
+    return true;
+}
+
+/// Which discovery, if any, a DIO belongs to. The option, not the
+/// RPLInstanceID, is what says so: AODV-RPL reuses a local RPLInstanceID for
+/// both halves of one discovery and picks the RREP-Instance ID by adding a
+/// Delta to the RREQ one, so the ID alone cannot separate them (@see
+/// rpl-aodv.cc, StartAodvRrepInstance()). A local instance whose option has
+/// already been stripped still gets its own bucket rather than silently
+/// counting as base-RPL housekeeping.
+///
+/// @param dio the DIO to classify
+/// @return the class it belongs to
+static DioClass
+ClassifyDio(const rpl::RplDioHeader& dio)
+{
+    if (dio.HasRreq())
+    {
+        return DIO_RREQ;
+    }
+    if (dio.HasRrep())
+    {
+        return DIO_RREP;
+    }
+    if (dio.HasP2pRdo())
+    {
+        return DIO_P2P_RDO;
+    }
+    if ((dio.GetInstanceId() & rpl::RPL_LOCAL_INSTANCE_FLAG) != 0)
+    {
+        return DIO_LOCAL_OTHER;
+    }
+    return DIO_BASE;
+}
+
+/// The same classification starting from a whole IPv6 packet, for the
+/// 6LoWPAN hooks, which see one before the IPv6 header has been stripped.
+///
+/// @param packet an IPv6 packet, header included
+/// @return its DioClass, or DIO_CLASS_COUNT for anything that is not a DIO
+static int
+ClassifyIpv6Packet(Ptr<const Packet> packet)
+{
+    Ptr<Packet> copy = packet->Copy();
+    Ipv6Header ipHeader;
+    if (copy->RemoveHeader(ipHeader) == 0)
+    {
+        return DIO_CLASS_COUNT;
+    }
+    uint8_t nextHeader = ipHeader.GetNextHeader();
+    if (!SkipIpv6ExtensionHeaders(copy, nextHeader) ||
+        nextHeader != Icmpv6L4Protocol::GetStaticProtocolNumber())
+    {
+        return DIO_CLASS_COUNT;
+    }
+    Icmpv6Header icmpHeader;
+    copy->PeekHeader(icmpHeader);
+    if (icmpHeader.GetType() != rpl::ICMPV6_RPL || icmpHeader.GetCode() != rpl::RPL_CODE_DIO)
+    {
+        return DIO_CLASS_COUNT;
+    }
+    Icmpv6Header stripped;
+    copy->RemoveHeader(stripped);
+    rpl::RplDioHeader dio;
+    if (copy->RemoveHeader(dio) == 0)
+    {
+        return DIO_CLASS_COUNT;
+    }
+    return ClassifyDio(dio);
+}
+
+/// One IPv6 packet handed to 6LoWPAN, before compression.
+static void
+OnSixLowPanTxPre(Ptr<const Packet> packet, Ptr<SixLowPanNetDevice>, uint32_t)
+{
+    g_lastSixClass = ClassifyIpv6Packet(packet);
+    g_sixTxPreByClass[g_lastSixClass]++;
+}
+
+/// One frame 6LoWPAN produced from it -- several, if it had to fragment.
+static void
+OnSixLowPanTx(Ptr<const Packet>, Ptr<SixLowPanNetDevice>, uint32_t)
+{
+    g_sixTxFragsByClass[g_lastSixClass]++;
+}
+
+/// One IPv6 packet successfully reassembled at a receiver. Against the TxPre
+/// count this is what says how much of a flood the fragmentation ate.
+static void
+OnSixLowPanRxPost(Ptr<const Packet> packet, Ptr<SixLowPanNetDevice>, uint32_t)
+{
+    g_sixRxPostByClass[ClassifyIpv6Packet(packet)]++;
+}
+
 static void
 OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
 {
@@ -580,30 +727,10 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
     // the hop-by-hop route the discovery just installed -- and it read as
     // zero P2P-DRO-ACKs ever sent until this walk was hoisted above the
     // check.
-    // Skipped by RFC 8200's own length rule rather than with
-    // Ipv6ExtensionHeader::RemoveHeader(): the generic extension header
-    // consumes only its two-byte prefix, which leaves the iterator inside the
-    // option data, so anything read afterwards -- an ICMPv6 type, say --
-    // comes off the wrong offset. That misalignment is invisible if the walk
-    // is only used to test NextHeader, which is why the data-side walk this
-    // replaces never showed it.
     uint8_t nextHeader = ipHeader.GetNextHeader();
-    while (nextHeader == Ipv6Header::IPV6_EXT_HOP_BY_HOP ||
-          nextHeader == Ipv6Header::IPV6_EXT_ROUTING ||
-          nextHeader == Ipv6Header::IPV6_EXT_DESTINATION)
+    if (!SkipIpv6ExtensionHeaders(copy, nextHeader))
     {
-        uint8_t prefix[2];
-        if (copy->CopyData(prefix, 2) < 2)
-        {
-            return;
-        }
-        uint32_t extLen = (static_cast<uint32_t>(prefix[1]) + 1) * 8;
-        if (copy->GetSize() < extLen)
-        {
-            return;
-        }
-        copy->RemoveAtStart(extLen);
-        nextHeader = prefix[0];
+        return;
     }
 
     {
@@ -657,31 +784,7 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
                 rpl::RplDioHeader dio;
                 if (dioCopy->RemoveHeader(dio) != 0)
                 {
-                    // The option, not the RPLInstanceID, is what says which
-                    // discovery a DIO belongs to: AODV-RPL reuses a local
-                    // RPLInstanceID for both halves of one discovery and picks
-                    // the RREP-Instance ID by adding a Delta to the RREQ one,
-                    // so the ID alone cannot separate them (@see rpl-aodv.cc,
-                    // SendRrep()). A local instance whose option has already
-                    // been stripped still gets its own bucket rather than
-                    // silently counting as base-RPL housekeeping.
-                    DioClass kind = DIO_BASE;
-                    if (dio.HasRreq())
-                    {
-                        kind = DIO_RREQ;
-                    }
-                    else if (dio.HasRrep())
-                    {
-                        kind = DIO_RREP;
-                    }
-                    else if (dio.HasP2pRdo())
-                    {
-                        kind = DIO_P2P_RDO;
-                    }
-                    else if ((dio.GetInstanceId() & rpl::RPL_LOCAL_INSTANCE_FLAG) != 0)
-                    {
-                        kind = DIO_LOCAL_OTHER;
-                    }
+                    DioClass kind = ClassifyDio(dio);
                     g_dioClassPackets[kind]++;
                     g_dioClassBytes[kind] += packet->GetSize();
                     if (!ipHeader.GetDestination().IsMulticast())
@@ -1770,6 +1873,12 @@ main(int argc, char** argv)
     {
         Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::SixLowPanNetDevice/Drop",
                                       MakeCallback(&OnSixLowPanDrop));
+        Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::SixLowPanNetDevice/TxPre",
+                                      MakeCallback(&OnSixLowPanTxPre));
+        Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::SixLowPanNetDevice/Tx",
+                                      MakeCallback(&OnSixLowPanTx));
+        Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::SixLowPanNetDevice/RxPost",
+                                      MakeCallback(&OnSixLowPanRxPost));
     }
 
     g_lastJoined.assign(nNodes, false);
@@ -2473,10 +2582,34 @@ main(int argc, char** argv)
               << g_rplCodePackets[rpl::RPL_CODE_DAO_ACK] << "/"
               << g_rplCodePackets[rpl::RPL_CODE_P2P_DRO] << "/"
               << g_rplCodePackets[rpl::RPL_CODE_P2P_DRO_ACK] << " pkts\n"
+              << "    6LoWPAN, DIO class (IPv6 pkts / frames out / reassembled in):\n"
+              << "       base " << g_sixTxPreByClass[DIO_BASE] << "/"
+              << g_sixTxFragsByClass[DIO_BASE] << "/" << g_sixRxPostByClass[DIO_BASE]
+              << "  RREQ " << g_sixTxPreByClass[DIO_RREQ] << "/"
+              << g_sixTxFragsByClass[DIO_RREQ] << "/" << g_sixRxPostByClass[DIO_RREQ]
+              << "  RREP " << g_sixTxPreByClass[DIO_RREP] << "/"
+              << g_sixTxFragsByClass[DIO_RREP] << "/" << g_sixRxPostByClass[DIO_RREP]
+              << "  P2P-RDO " << g_sixTxPreByClass[DIO_P2P_RDO] << "/"
+              << g_sixTxFragsByClass[DIO_P2P_RDO] << "/" << g_sixRxPostByClass[DIO_P2P_RDO]
+              << "  other " << g_sixTxPreByClass[DIO_CLASS_COUNT] << "/"
+              << g_sixTxFragsByClass[DIO_CLASS_COUNT] << "/"
+              << g_sixRxPostByClass[DIO_CLASS_COUNT] << "\n"
               << "    Temporary DODAGs      : " << tempDodagCount << " (RREQ " << tempDodagsRreq
               << ", RREP " << tempDodagsRrep << ", P2P-RDO " << tempDodagsRdo << ")"
               << ", mean " << tempEmittersAvg << " emitting nodes, " << tempTxAvg
               << " DIO tx, alive " << tempSpanSAvg << " s\n";
+
+    // Every DIO class pooled: which one carries the discovery differs by
+    // protocol, so one column pair per class would be empty half the time.
+    uint64_t sixTxPreDio = 0;
+    uint64_t sixTxFragsDio = 0;
+    uint64_t sixRxPostDio = 0;
+    for (int c = 0; c < DIO_CLASS_COUNT; ++c)
+    {
+        sixTxPreDio += g_sixTxPreByClass[c];
+        sixTxFragsDio += g_sixTxFragsByClass[c];
+        sixRxPostDio += g_sixRxPostByClass[c];
+    }
 
     // ---- KPI CSV (spec section 5.1) ----
     bool writeHeader = false;
@@ -2506,7 +2639,9 @@ main(int argc, char** argv)
                "rreqGapMedianS,rrepGapMedianS,rdoGapMedianS,"
                "dioRreqUniPkts,dioRrepUniPkts,dioRrepUniBytes,"
                "discoveryTargetReached,loopCountBase,loopCountLocal,"
-               "ndRs,ndRa,ndNs,ndNa,ndRedirect\n";
+               "ndRs,ndRa,ndNs,ndNa,ndRedirect,"
+               "sixFragTimeouts,sixTxPreDio,sixTxFragsDio,sixRxPostDio,"
+               "sixTxPreOther,sixTxFragsOther,sixRxPostOther\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -2542,7 +2677,13 @@ main(int argc, char** argv)
         << g_dioClassUnicastPackets[DIO_RREP] << "," << g_dioClassUnicastBytes[DIO_RREP] << ","
         << discoveryTargetReachedCount << "," << g_loopDetectedBase << "," << g_loopDetectedLocal
         << "," << g_ndByType[0] << "," << g_ndByType[1] << "," << g_ndByType[2] << ","
-        << g_ndByType[3] << "," << g_ndByType[4] << "\n";
+        << g_ndByType[3] << "," << g_ndByType[4] << ","
+        << (g_sixDropByReason.count(static_cast<int>(SixLowPanNetDevice::DROP_FRAGMENT_TIMEOUT))
+                ? g_sixDropByReason[static_cast<int>(SixLowPanNetDevice::DROP_FRAGMENT_TIMEOUT)]
+                : 0)
+        << "," << sixTxPreDio << "," << sixTxFragsDio << "," << sixRxPostDio << ","
+        << g_sixTxPreByClass[DIO_CLASS_COUNT] << "," << g_sixTxFragsByClass[DIO_CLASS_COUNT]
+        << "," << g_sixRxPostByClass[DIO_CLASS_COUNT] << "\n";
     csv.close();
 
     //
