@@ -272,6 +272,65 @@ static uint64_t g_macTxDrops = 0; // frames abandoned: retries exhausted or CSMA
 static uint32_t g_payloadBytes = 512; // UDP payload of background/foreground flows
 static uint32_t g_bgIntervalS = 0;    // 0 = scenario default (5 s scenario 1, 10 s otherwise)
 
+// ---------------------------------------------------------------------------
+// Control-plane cost attribution
+// ---------------------------------------------------------------------------
+// `controlBytes` alone says AODV-RPL costs 1.7-2.7x what P2P-RPL costs but not
+// where the bytes go. Splitting by ICMPv6 code is only half an answer, because
+// both reactive protocols run their discovery over *DIOs* of a temporary local
+// RPLInstance, so DIS/DIO/DAO/DAO-ACK/P2P-DRO lumps the base DODAG's
+// housekeeping together with the discovery flood. RplDioHeader carries the
+// discriminating suboption, so every DIO is attributed to the base (global)
+// DODAG, to an AODV-RPL RREQ-Instance, to an AODV-RPL RREP-Instance, or to a
+// P2P-RPL temporary DAG.
+enum DioClass
+{
+    DIO_BASE = 0,     //!< global RPLInstance, i.e. ordinary base-RPL housekeeping
+    DIO_RREQ,         //!< carries an RFC 9854 RREQ option
+    DIO_RREP,         //!< carries an RFC 9854 RREP option
+    DIO_P2P_RDO,      //!< carries an RFC 6997 P2P-RDO option
+    DIO_LOCAL_OTHER,  //!< local RPLInstance but no discovery option left on it
+    DIO_CLASS_COUNT
+};
+static uint64_t g_dioClassPackets[DIO_CLASS_COUNT] = {};
+static uint64_t g_dioClassBytes[DIO_CLASS_COUNT] = {};
+/// Same buckets again, but only the unicast ones. An RREP option travels two
+/// very different ways in AODV-RPL: multicast, as the Trickle-paced RREP-
+/// Instance flood an asymmetric route needs, or unicast, as the RFC 9854
+/// section 7 Gratuitous RREP a relay with a cached route sends straight back
+/// to OrigNode. Pooling them hides which of the two is actually being paid
+/// for.
+static uint64_t g_dioClassUnicastPackets[DIO_CLASS_COUNT] = {};
+static uint64_t g_dioClassUnicastBytes[DIO_CLASS_COUNT] = {};
+/// Per ICMPv6 RPL code (RPL_CODE_DIS..RPL_CODE_P2P_DRO_ACK), so the DAO/DRO
+/// side of the ledger lands in the CSV too rather than only in the stdout dump.
+static uint64_t g_rplCodePackets[6] = {};
+static uint64_t g_rplCodeBytes[6] = {};
+
+/// Census of one temporary (local-RPLInstance) DODAG: how far the flood spread
+/// (distinct transmitting nodes), what it cost in DIOs, and how long it kept
+/// Trickling after it was created. A discovery that finishes in 400 ms but
+/// leaves its instance re-transmitting for the remaining 300 s of the run
+/// shows up here and nowhere else.
+struct TempDodagStats
+{
+    std::set<uint32_t> emitters; //!< node IDs that transmitted a DIO for it
+    uint64_t txCount = 0;        //!< DIO transmissions, all nodes, all repeats
+    uint64_t txBytes = 0;        //!< their IPv6 byte total
+    double firstTxS = -1.0;      //!< first DIO transmission, seconds
+    double lastTxS = -1.0;       //!< last DIO transmission, seconds
+    DioClass kind = DIO_LOCAL_OTHER; //!< first discovery option seen on it
+    std::map<uint32_t, double> lastTxPerNode; //!< node ID -> its own previous DIO, seconds
+};
+static std::map<std::pair<uint8_t, Ipv6Address>, TempDodagStats> g_tempDodags;
+
+/// Gaps between one node's consecutive DIO transmissions for the same
+/// temporary DODAG. This is what separates the two ways a Trickle timer can
+/// be expensive: gaps sitting at Imin mean the timer is being reset (declared
+/// inconsistent) over and over, while gaps sitting at Imax mean it doubled
+/// normally and the cost is simply a missing suppression rule.
+static std::vector<double> g_dioGapsByClass[DIO_CLASS_COUNT];
+
 static void
 OnPhyTxBegin(Ptr<const Packet> p)
 {
@@ -490,21 +549,88 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
         {
             g_controlBytes += packet->GetSize();
             g_controlPackets++;
+            if (icmpHeader.GetCode() < 6)
+            {
+                g_rplCodePackets[icmpHeader.GetCode()]++;
+                g_rplCodeBytes[icmpHeader.GetCode()] += packet->GetSize();
+            }
             if (icmpHeader.GetCode() == rpl::RPL_CODE_DIO)
             {
                 if (g_dioWindowActive)
                 {
                     g_dioPacketsInWindow++;
                 }
-                if (!g_rootGlobalAddr.IsAny() &&
-                    (ipHeader.GetSource() == g_rootGlobalAddr ||
-                     ipHeader.GetSource() == g_rootLinkLocalAddr))
+                Ptr<Packet> dioCopy = copy->Copy();
+                Icmpv6Header stripped;
+                dioCopy->RemoveHeader(stripped);
+                rpl::RplDioHeader dio;
+                if (dioCopy->RemoveHeader(dio) != 0)
                 {
-                    Ptr<Packet> dioCopy = copy->Copy();
-                    Icmpv6Header stripped;
-                    dioCopy->RemoveHeader(stripped);
-                    rpl::RplDioHeader dio;
-                    if (dioCopy->RemoveHeader(dio) != 0)
+                    // The option, not the RPLInstanceID, is what says which
+                    // discovery a DIO belongs to: AODV-RPL reuses a local
+                    // RPLInstanceID for both halves of one discovery and picks
+                    // the RREP-Instance ID by adding a Delta to the RREQ one,
+                    // so the ID alone cannot separate them (@see rpl-aodv.cc,
+                    // SendRrep()). A local instance whose option has already
+                    // been stripped still gets its own bucket rather than
+                    // silently counting as base-RPL housekeeping.
+                    DioClass kind = DIO_BASE;
+                    if (dio.HasRreq())
+                    {
+                        kind = DIO_RREQ;
+                    }
+                    else if (dio.HasRrep())
+                    {
+                        kind = DIO_RREP;
+                    }
+                    else if (dio.HasP2pRdo())
+                    {
+                        kind = DIO_P2P_RDO;
+                    }
+                    else if ((dio.GetInstanceId() & rpl::RPL_LOCAL_INSTANCE_FLAG) != 0)
+                    {
+                        kind = DIO_LOCAL_OTHER;
+                    }
+                    g_dioClassPackets[kind]++;
+                    g_dioClassBytes[kind] += packet->GetSize();
+                    if (!ipHeader.GetDestination().IsMulticast())
+                    {
+                        g_dioClassUnicastPackets[kind]++;
+                        g_dioClassUnicastBytes[kind] += packet->GetSize();
+                    }
+
+                    if (kind != DIO_BASE)
+                    {
+                        auto& st = g_tempDodags[{dio.GetInstanceId(), dio.GetDodagId()}];
+                        double nowS = Simulator::Now().GetSeconds();
+                        if (st.firstTxS < 0.0)
+                        {
+                            st.firstTxS = nowS;
+                            st.kind = kind;
+                        }
+                        st.lastTxS = nowS;
+                        st.txCount++;
+                        st.txBytes += packet->GetSize();
+                        Ptr<Node> node = ipv6->GetObject<Node>();
+                        if (node)
+                        {
+                            st.emitters.insert(node->GetId());
+                            auto it = st.lastTxPerNode.find(node->GetId());
+                            if (it != st.lastTxPerNode.end())
+                            {
+                                g_dioGapsByClass[kind].push_back(nowS - it->second);
+                                it->second = nowS;
+                            }
+                            else
+                            {
+                                st.lastTxPerNode[node->GetId()] = nowS;
+                            }
+                        }
+                    }
+
+                    if (!g_rootGlobalAddr.IsAny() &&
+                        (ipHeader.GetSource() == g_rootGlobalAddr ||
+                         ipHeader.GetSource() == g_rootLinkLocalAddr))
                     {
                         g_rootDioVersions.emplace_back(Simulator::Now().GetSeconds(),
                                                        dio.GetVersionNumber());
@@ -1214,6 +1340,15 @@ main(int argc, char** argv)
     uint32_t p2pDioIntervalDoublings = 4;
     uint32_t aodvDioIntervalMinMs = 128;
     uint32_t aodvDioIntervalDoublings = 4;
+    // Control-plane cost attribution: AODV-RPL's temporary instances have no
+    // Trickle redundancy constant of their own (P2P-RPL's have
+    // P2pDioRedundancy = 1), so they inherit the base DODAG's DioRedundancy,
+    // and they take the generic RFC 6550 section 8.3 consistency rule, which
+    // restarts Trickle on any preferred-parent change rather than only on a
+    // rank improvement. -1 / false keep both as they are.
+    int32_t aodvDioRedundancy = -1;
+    bool aodvTrickleRankOnlyReset = false;
+    bool aodvGratuitousRrepOnce = false;
     bool p2pDroAckRequested = true;
     // Evaluation-plan item C-3: directional channel-quality coefficient for
     // H8's external validity (does AODV-RPL's asymmetric mode pay off once
@@ -1285,6 +1420,17 @@ main(int argc, char** argv)
     cmd.AddValue("aodvDioIntervalDoublings",
                  "AODV-RPL discovery Trickle doublings (module default 4)",
                  aodvDioIntervalDoublings);
+    cmd.AddValue("aodvDioRedundancy",
+                 "Trickle k for AODV-RPL RREQ/RREP-DIOs, -1 to inherit dioRedundancy",
+                 aodvDioRedundancy);
+    cmd.AddValue("aodvTrickleRankOnlyReset",
+                 "Restart the AODV-RPL discovery Trickle only on a rank improvement, as "
+                 "RFC 6997 section 9.2 has P2P-RPL do (module default false)",
+                 aodvTrickleRankOnlyReset);
+    cmd.AddValue("aodvGratuitousRrepOnce",
+                 "Send at most one AODV-RPL Gratuitous RREP per instance and target "
+                 "(module default false)",
+                 aodvGratuitousRrepOnce);
     cmd.AddValue("p2pDroAckRequested",
                  "Whether P2P-RPL requests a P2P-DRO-ACK for its replies (module default true)",
                  p2pDroAckRequested);
@@ -1472,6 +1618,9 @@ main(int argc, char** argv)
     rplHelper.Set("P2pDioIntervalDoublings", UintegerValue(p2pDioIntervalDoublings));
     rplHelper.Set("AodvDioIntervalMin", TimeValue(MilliSeconds(aodvDioIntervalMinMs)));
     rplHelper.Set("AodvDioIntervalDoublings", UintegerValue(aodvDioIntervalDoublings));
+    rplHelper.Set("AodvDioRedundancy", IntegerValue(aodvDioRedundancy));
+    rplHelper.Set("AodvTrickleRankOnlyReset", BooleanValue(aodvTrickleRankOnlyReset));
+    rplHelper.Set("AodvGratuitousRrepOnce", BooleanValue(aodvGratuitousRrepOnce));
     rplHelper.Set("P2pDroAckRequested", BooleanValue(p2pDroAckRequested));
     if (scenario == 1)
     {
@@ -2107,6 +2256,122 @@ main(int argc, char** argv)
         std::cout << "\n";
     }
 
+    // ---- control-plane cost attribution (@see DioClass, TempDodagStats) ----
+    const uint64_t tempDodagCount = g_tempDodags.size();
+    double tempEmittersAvg = 0.0;
+    double tempTxAvg = 0.0;
+    double tempSpanSAvg = 0.0;
+    uint64_t tempDodagsRreq = 0;
+    uint64_t tempDodagsRrep = 0;
+    uint64_t tempDodagsRdo = 0;
+    if (tempDodagCount > 0)
+    {
+        double emitters = 0.0;
+        double txs = 0.0;
+        double spans = 0.0;
+        for (const auto& kv : g_tempDodags)
+        {
+            emitters += kv.second.emitters.size();
+            txs += kv.second.txCount;
+            spans += kv.second.lastTxS - kv.second.firstTxS;
+            if (kv.second.kind == DIO_RREQ)
+            {
+                tempDodagsRreq++;
+            }
+            else if (kv.second.kind == DIO_RREP)
+            {
+                tempDodagsRrep++;
+            }
+            else if (kv.second.kind == DIO_P2P_RDO)
+            {
+                tempDodagsRdo++;
+            }
+        }
+        tempEmittersAvg = emitters / tempDodagCount;
+        tempTxAvg = txs / tempDodagCount;
+        tempSpanSAvg = spans / tempDodagCount;
+    }
+    // Per-class view of the same census: pooling RREQ- and RREP-Instances
+    // together would hide that they are two separate floods.
+    auto medianOf = [](std::vector<double> v) {
+        if (v.empty())
+        {
+            return 0.0;
+        }
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    static const char* kDioClassName[DIO_CLASS_COUNT] = {"base", "RREQ", "RREP", "P2P-RDO",
+                                                         "local-no-opt"};
+    std::cout << " Temporary DODAG census (per DIO class):\n"
+              << "    class        inst  emitters/inst  DIOtx/inst  DIOtx/node  alive(s)  "
+                 "median gap(s)\n";
+    double reqGapMedian = 0.0;
+    double repGapMedian = 0.0;
+    double rdoGapMedian = 0.0;
+    for (int c = DIO_RREQ; c < DIO_CLASS_COUNT; ++c)
+    {
+        uint64_t insts = 0;
+        double emitters = 0.0;
+        double txs = 0.0;
+        double spans = 0.0;
+        for (const auto& kv : g_tempDodags)
+        {
+            if (kv.second.kind != c)
+            {
+                continue;
+            }
+            insts++;
+            emitters += kv.second.emitters.size();
+            txs += kv.second.txCount;
+            spans += kv.second.lastTxS - kv.second.firstTxS;
+        }
+        if (insts == 0)
+        {
+            continue;
+        }
+        double gap = medianOf(g_dioGapsByClass[c]);
+        if (c == DIO_RREQ)
+        {
+            reqGapMedian = gap;
+        }
+        else if (c == DIO_RREP)
+        {
+            repGapMedian = gap;
+        }
+        else if (c == DIO_P2P_RDO)
+        {
+            rdoGapMedian = gap;
+        }
+        std::cout << "    " << std::left << std::setw(13) << kDioClassName[c] << std::right
+                  << std::setw(4) << insts << std::setw(15) << (emitters / insts) << std::setw(12)
+                  << (txs / insts) << std::setw(12)
+                  << (emitters > 0 ? txs / emitters : 0.0) << std::setw(10) << (spans / insts)
+                  << std::setw(14) << gap << "\n";
+    }
+    std::cout << " Control plane by message class:\n"
+              << "    DIO base(global inst) : " << g_dioClassPackets[DIO_BASE] << " pkts, "
+              << g_dioClassBytes[DIO_BASE] << " B\n"
+              << "    DIO AODV RREQ         : " << g_dioClassPackets[DIO_RREQ] << " pkts, "
+              << g_dioClassBytes[DIO_RREQ] << " B\n"
+              << "    DIO AODV RREP         : " << g_dioClassPackets[DIO_RREP] << " pkts, "
+              << g_dioClassBytes[DIO_RREP] << " B  (of which unicast, i.e. Gratuitous RREP: "
+              << g_dioClassUnicastPackets[DIO_RREP] << " pkts, "
+              << g_dioClassUnicastBytes[DIO_RREP] << " B)\n"
+              << "    DIO P2P-RDO           : " << g_dioClassPackets[DIO_P2P_RDO] << " pkts, "
+              << g_dioClassBytes[DIO_P2P_RDO] << " B\n"
+              << "    DIO local, no option  : " << g_dioClassPackets[DIO_LOCAL_OTHER] << " pkts, "
+              << g_dioClassBytes[DIO_LOCAL_OTHER] << " B\n"
+              << "    DIS/DAO/DAO-ACK/DRO/DRO-ACK: " << g_rplCodePackets[rpl::RPL_CODE_DIS] << "/"
+              << g_rplCodePackets[rpl::RPL_CODE_DAO] << "/"
+              << g_rplCodePackets[rpl::RPL_CODE_DAO_ACK] << "/"
+              << g_rplCodePackets[rpl::RPL_CODE_P2P_DRO] << "/"
+              << g_rplCodePackets[rpl::RPL_CODE_P2P_DRO_ACK] << " pkts\n"
+              << "    Temporary DODAGs      : " << tempDodagCount << " (RREQ " << tempDodagsRreq
+              << ", RREP " << tempDodagsRrep << ", P2P-RDO " << tempDodagsRdo << ")"
+              << ", mean " << tempEmittersAvg << " emitting nodes, " << tempTxAvg
+              << " DIO tx, alive " << tempSpanSAvg << " s\n";
+
     // ---- KPI CSV (spec section 5.1) ----
     bool writeHeader = false;
     {
@@ -2127,7 +2392,13 @@ main(int argc, char** argv)
                "p2pDioIntervalDoublings,aodvDioIntervalMinMs,aodvDioIntervalDoublings,"
                "p2pDroAckRequested,linkAsymmetry,aodvForceAsymmetric,bgPdr,link,payloadBytes,"
                "lrRangeM,lrMarginDb,lrAsymDb,lrNodePenaltySigmaDb,lrShadowSigmaDb,phyTxFrames,"
-               "phyTxBytes,macTxOk,macTxDrops,ndPackets,ipTxPackets,ocp\n";
+               "phyTxBytes,macTxOk,macTxDrops,ndPackets,ipTxPackets,ocp,"
+               "dioBasePkts,dioBaseBytes,dioRreqPkts,dioRreqBytes,dioRrepPkts,dioRrepBytes,"
+               "dioRdoPkts,dioRdoBytes,dioLocalOtherPkts,dioLocalOtherBytes,disPkts,daoPkts,"
+               "daoAckPkts,droPkts,droAckPkts,tempDodags,tempDodagsRreq,tempDodagsRrep,"
+               "tempDodagsRdo,tempEmittersAvg,tempTxAvg,tempSpanS,"
+               "rreqGapMedianS,rrepGapMedianS,rdoGapMedianS,"
+               "dioRreqUniPkts,dioRrepUniPkts,dioRrepUniBytes\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -2147,7 +2418,20 @@ main(int argc, char** argv)
         << "," << payloadBytes << "," << lrRangeM << "," << lrMarginDb << "," << lrAsymDb << ","
         << lrNodePenaltySigmaDb << "," << lrShadowSigmaDb << "," << g_phyTxFrames << ","
         << g_phyTxBytes << "," << g_macTxOk << "," << g_macTxDrops << "," << g_ndPackets << ","
-        << g_ipTxPackets << "," << ocp << "\n";
+        << g_ipTxPackets << "," << ocp << "," << g_dioClassPackets[DIO_BASE] << ","
+        << g_dioClassBytes[DIO_BASE] << "," << g_dioClassPackets[DIO_RREQ] << ","
+        << g_dioClassBytes[DIO_RREQ] << "," << g_dioClassPackets[DIO_RREP] << ","
+        << g_dioClassBytes[DIO_RREP] << "," << g_dioClassPackets[DIO_P2P_RDO] << ","
+        << g_dioClassBytes[DIO_P2P_RDO] << "," << g_dioClassPackets[DIO_LOCAL_OTHER] << ","
+        << g_dioClassBytes[DIO_LOCAL_OTHER] << "," << g_rplCodePackets[rpl::RPL_CODE_DIS] << ","
+        << g_rplCodePackets[rpl::RPL_CODE_DAO] << ","
+        << g_rplCodePackets[rpl::RPL_CODE_DAO_ACK] << ","
+        << g_rplCodePackets[rpl::RPL_CODE_P2P_DRO] << ","
+        << g_rplCodePackets[rpl::RPL_CODE_P2P_DRO_ACK] << "," << tempDodagCount << ","
+        << tempDodagsRreq << "," << tempDodagsRrep << "," << tempDodagsRdo << ","
+        << tempEmittersAvg << "," << tempTxAvg << "," << tempSpanSAvg << "," << reqGapMedian << ","
+        << repGapMedian << "," << rdoGapMedian << "," << g_dioClassUnicastPackets[DIO_RREQ] << ","
+        << g_dioClassUnicastPackets[DIO_RREP] << "," << g_dioClassUnicastBytes[DIO_RREP] << "\n";
     csv.close();
 
     //

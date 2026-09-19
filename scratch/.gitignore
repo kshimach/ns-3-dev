@@ -43,3 +43,8 @@
 # P2P-RPL vs AODV-RPL analysis for that link layer.
 !lrwpan-link-probe.cc
 !analyze-tier2-lrwpan.py
+
+# Root-cause decomposition of AODV-RPL's Tier 2 control-plane cost: the
+# counterfactual sweep runner and its analysis.
+!run-aodv-control-cost.sh
+!analyze-aodv-control-cost.py
