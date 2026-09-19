@@ -21,6 +21,8 @@ declare -a ARMS=(
   "D-k1+reset|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvTrickleRankOnlyReset=true"
   "E-grrep|--reactiveProtocol=aodvrpl --aodvGratuitousRrepOnce=true"
   "F-all|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvTrickleRankOnlyReset=true --aodvGratuitousRrepOnce=true"
+  "H-mri0|--reactiveProtocol=aodvrpl --aodvMaxRankIncrease=0"
+  "I-all+mri0|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvTrickleRankOnlyReset=true --aodvGratuitousRrepOnce=true --aodvMaxRankIncrease=0"
   "G-p2p|--reactiveProtocol=p2prpl"
 )
 

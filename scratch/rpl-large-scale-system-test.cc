@@ -262,6 +262,10 @@ class NodeOffsetLossModel : public PropagationLossModel
 static uint64_t g_phyTxFrames = 0;
 static uint64_t g_phyTxBytes = 0;
 static uint64_t g_ndPackets = 0;   // IPv6 neighbour discovery (RS/RA/NS/NA/redirect) sent, per hop
+/// The same, split by ICMPv6 type 133..137. Address resolution (NS/NA) is
+/// what a unicast next hop costs and router advertisement (RS/RA) is not, so
+/// the split is what connects ND volume to how each protocol sends its reply.
+static uint64_t g_ndByType[5] = {}; // index = type - 133
 static uint64_t g_ipTxPackets = 0; // every IPv6 packet handed to a device (forwards included)
 static std::map<int, uint64_t> g_ipDropByReason;   // Ipv6L3Protocol::DropReason -> count
 static std::map<int, uint64_t> g_sixDropByReason;  // SixLowPanNetDevice::DropReason -> count
@@ -482,11 +486,60 @@ static uint32_t g_maxAodvRoutes = 0;
 // change; this detection previously had no externally observable effect at
 // all).
 static uint64_t g_loopDetectedCount = 0;
+/// The same count split by which Instance the looping packet was travelling
+/// on: a Global RPLInstanceID is the base DODAG's ordinary upward/downward
+/// forwarding, a Local one (RFC 6550 section 5.1, top bit set) is a P2P-RPL
+/// or AODV-RPL reactive route. The pooled count cannot say which, and the two
+/// have entirely different causes.
+static uint64_t g_loopDetectedBase = 0;
+static uint64_t g_loopDetectedLocal = 0;
 
 static void
 OnRankErrorConfirmed(uint8_t instanceId)
 {
     g_loopDetectedCount++;
+    if ((instanceId & rpl::RPL_LOCAL_INSTANCE_FLAG) != 0)
+    {
+        g_loopDetectedLocal++;
+    }
+    else
+    {
+        g_loopDetectedBase++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request-reached-the-target instrumentation
+// ---------------------------------------------------------------------------
+// g_discoveryLatencyMs only records whether a discovery completed end to end,
+// which cannot say whether a failure lost the request on its way to the target
+// or the reply on its way back. contrib/rpl's "DiscoveryTargetReached" trace
+// fires on the node that recognises itself as the TargNode/Target, once per
+// temporary DODAG, and carries that DODAG's DODAGID -- which for both
+// protocols is the *originating* node's global address. Matching that back to
+// an attempt is therefore a lookup on the origin, the same way
+// scratch/p2p-rpl-paper-replication.cc does it.
+//
+// One origin can in principle have several discoveries outstanding at once,
+// and the trace does not say which; entries are matched oldest-first, so an
+// individual key may be attributed to the wrong one of that origin's
+// concurrent attempts while the total -- the only thing the CSV reports --
+// stays exact.
+static std::map<Ipv6Address, std::vector<std::pair<uint32_t, Ipv6Address>>> g_pendingByOrigin;
+static std::set<std::pair<uint32_t, Ipv6Address>> g_targetReachedKeys;
+
+static void
+OnDiscoveryTargetReached(std::string context, uint8_t instanceId, Ipv6Address dodagId)
+{
+    (void)context;
+    (void)instanceId;
+    auto it = g_pendingByOrigin.find(dodagId);
+    if (it == g_pendingByOrigin.end() || it->second.empty())
+    {
+        return;
+    }
+    g_targetReachedKeys.insert(it->second.front());
+    it->second.erase(it->second.begin());
 }
 
 /// One row of the TC-xxx checklist (spec section 4). `applicable == false`
@@ -544,6 +597,7 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
         if (icmpHeader.GetType() >= 133 && icmpHeader.GetType() <= 137)
         {
             g_ndPackets++;
+            g_ndByType[icmpHeader.GetType() - 133]++;
         }
         if (icmpHeader.GetType() == rpl::ICMPV6_RPL)
         {
@@ -1135,6 +1189,14 @@ TriggerAndTrackDiscovery(uint32_t srcIdx,
                          double timeoutS)
 {
     Ptr<rpl::RplRoutingProtocol> rpl = g_nodes.Get(srcIdx)->GetObject<rpl::RplRoutingProtocol>();
+    // Registered before the call, not after: the temporary DODAG is formed
+    // inside it and, on a one-hop discovery, the target can recognise itself
+    // and fire DiscoveryTargetReached before this function resumes.
+    Ipv6Address originAddr = rpl->GetGlobalAddress();
+    if (!originAddr.IsAny())
+    {
+        g_pendingByOrigin[originAddr].emplace_back(srcIdx, target);
+    }
     if (protocol == "p2prpl")
     {
         rpl->DiscoverP2pRoute(target, hopByHop);
@@ -1347,6 +1409,7 @@ main(int argc, char** argv)
     // restarts Trickle on any preferred-parent change rather than only on a
     // rank improvement. -1 / false keep both as they are.
     int32_t aodvDioRedundancy = -1;
+    int32_t aodvMaxRankIncrease = -1;
     bool aodvTrickleRankOnlyReset = false;
     bool aodvGratuitousRrepOnce = false;
     bool p2pDroAckRequested = true;
@@ -1423,6 +1486,10 @@ main(int argc, char** argv)
     cmd.AddValue("aodvDioRedundancy",
                  "Trickle k for AODV-RPL RREQ/RREP-DIOs, -1 to inherit dioRedundancy",
                  aodvDioRedundancy);
+    cmd.AddValue("aodvMaxRankIncrease",
+                 "DAGMaxRankIncrease for AODV-RPL RREQ/RREP-Instances, 0 to disable local "
+                 "repair as RFC 6997 has P2P-RPL do, -1 to inherit the base DODAG's",
+                 aodvMaxRankIncrease);
     cmd.AddValue("aodvTrickleRankOnlyReset",
                  "Restart the AODV-RPL discovery Trickle only on a rank improvement, as "
                  "RFC 6997 section 9.2 has P2P-RPL do (module default false)",
@@ -1619,6 +1686,7 @@ main(int argc, char** argv)
     rplHelper.Set("AodvDioIntervalMin", TimeValue(MilliSeconds(aodvDioIntervalMinMs)));
     rplHelper.Set("AodvDioIntervalDoublings", UintegerValue(aodvDioIntervalDoublings));
     rplHelper.Set("AodvDioRedundancy", IntegerValue(aodvDioRedundancy));
+    rplHelper.Set("AodvMaxRankIncrease", IntegerValue(aodvMaxRankIncrease));
     rplHelper.Set("AodvTrickleRankOnlyReset", BooleanValue(aodvTrickleRankOnlyReset));
     rplHelper.Set("AodvGratuitousRrepOnce", BooleanValue(aodvGratuitousRrepOnce));
     rplHelper.Set("P2pDroAckRequested", BooleanValue(p2pDroAckRequested));
@@ -1671,6 +1739,8 @@ main(int argc, char** argv)
     Config::ConnectWithoutContext(
         "/NodeList/*/$ns3::rpl::RplRoutingProtocol/RankErrorConfirmed",
         MakeCallback(&OnRankErrorConfirmed));
+    Config::Connect("/NodeList/*/$ns3::rpl::RplRoutingProtocol/DiscoveryTargetReached",
+                    MakeCallback(&OnDiscoveryTargetReached));
     Config::ConnectWithoutContext("/NodeList/*/$ns3::Ipv6L3Protocol/Drop",
                                   MakeCallback(&OnIpv6Drop));
     if (useLrWpan)
@@ -2148,6 +2218,18 @@ main(int argc, char** argv)
     double discoveryLatencyAvgMs =
         (discoverySuccessCount > 0) ? (discoveryLatencySum / discoverySuccessCount) : 0.0;
 
+    // Of those attempts, how many got their request as far as the target at
+    // all. discoverySuccessCount counts the full round trip, so the gap
+    // between the two is the reply direction's own loss.
+    uint32_t discoveryTargetReachedCount = 0;
+    for (const auto& kv : g_discoveryLatencyMs)
+    {
+        if (g_targetReachedKeys.count(kv.first) != 0)
+        {
+            discoveryTargetReachedCount++;
+        }
+    }
+
     // Fallback Success Rate: among foreground packets whose *send* time (per
     // their own SeqTsHeader) falls after the last discovery in this run
     // completed plus its route's expiry, none should be lost. We approximate
@@ -2214,7 +2296,8 @@ main(int argc, char** argv)
               << " Hop Stretch Ratio:      " << hopStretch << " (n=" << hopStretchCount << ")\n"
               << " Control Overhead Ratio: " << controlOverheadRatio * 100.0 << " %\n"
               << " Discovery Attempts:     " << discoveryAttemptCount
-              << " (succeeded: " << discoverySuccessCount << ")\n"
+              << " (request reached target: " << discoveryTargetReachedCount
+              << ", succeeded: " << discoverySuccessCount << ")\n"
               << " Discovery Latency:      avg " << discoveryLatencyAvgMs << " ms, max "
               << discoveryLatencyMax << " ms\n"
               << " Fallback Success Rate:  " << fallbackSuccessRate * 100.0
@@ -2398,7 +2481,9 @@ main(int argc, char** argv)
                "daoAckPkts,droPkts,droAckPkts,tempDodags,tempDodagsRreq,tempDodagsRrep,"
                "tempDodagsRdo,tempEmittersAvg,tempTxAvg,tempSpanS,"
                "rreqGapMedianS,rrepGapMedianS,rdoGapMedianS,"
-               "dioRreqUniPkts,dioRrepUniPkts,dioRrepUniBytes\n";
+               "dioRreqUniPkts,dioRrepUniPkts,dioRrepUniBytes,"
+               "discoveryTargetReached,loopCountBase,loopCountLocal,"
+               "ndRs,ndRa,ndNs,ndNa,ndRedirect\n";
     }
     csv << scenario << "," << nNodes << "," << topology << "," << commRange << ","
         << edgeSuccessRate << "," << mop << "," << (hopByHop ? 1 : 0) << "," << proto << ","
@@ -2431,7 +2516,10 @@ main(int argc, char** argv)
         << tempDodagsRreq << "," << tempDodagsRrep << "," << tempDodagsRdo << ","
         << tempEmittersAvg << "," << tempTxAvg << "," << tempSpanSAvg << "," << reqGapMedian << ","
         << repGapMedian << "," << rdoGapMedian << "," << g_dioClassUnicastPackets[DIO_RREQ] << ","
-        << g_dioClassUnicastPackets[DIO_RREP] << "," << g_dioClassUnicastBytes[DIO_RREP] << "\n";
+        << g_dioClassUnicastPackets[DIO_RREP] << "," << g_dioClassUnicastBytes[DIO_RREP] << ","
+        << discoveryTargetReachedCount << "," << g_loopDetectedBase << "," << g_loopDetectedLocal
+        << "," << g_ndByType[0] << "," << g_ndByType[1] << "," << g_ndByType[2] << ","
+        << g_ndByType[3] << "," << g_ndByType[4] << "\n";
     csv.close();
 
     //

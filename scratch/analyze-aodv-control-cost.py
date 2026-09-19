@@ -37,7 +37,8 @@ import numpy as np
 import pandas as pd
 
 RNG = np.random.default_rng(20260919)
-ORDER = ["A-baseline", "B-k1", "C-reset", "D-k1+reset", "E-grrep", "F-all", "G-p2p"]
+ORDER = ["A-baseline", "B-k1", "C-reset", "D-k1+reset", "E-grrep", "F-all", "H-mri0",
+         "I-all+mri0", "G-p2p-noACK", "G-p2p"]
 
 
 def bootstrap_ratio_ci(numer, denom, n_boot=20000):
@@ -99,6 +100,39 @@ def main():
         r, lo, hi = bootstrap_ratio_ci(df[df.arm == a].controlBytes.values, ref)
         print(f"{a:<13} {g.loc[a].ctrlKB:9.1f} {100 * (g.loc[a].ctrlKB / base - 1):+8.1f}%   "
               f"{r:5.2f}  [{lo:.2f}, {hi:.2f}]")
+
+    print("\n--- where a failed discovery is lost: request side or reply side ---")
+    print("A request that a Gratuitous RREP answers from a cached route never reaches the")
+    print("target, so for AODV-RPL 'reached' understates the request side slightly.")
+    print(f"{'arm':<13} {'attempts':>9} {'reached':>8} {'success':>8} {'reply kept':>11}")
+    for a in present:
+        x = df[df.arm == a]
+        att, reach, succ = x.discoveryAttempts.sum(), x.discoveryTargetReached.sum(), \
+            x.discoverySuccess.sum()
+        print(f"{a:<13} {att:9.0f} {reach:8.0f} {succ:8.0f} "
+              f"{(100 * succ / reach if reach else 0):10.1f}%")
+
+    print("\n--- confirmed routing loops, split by the Instance the looping packet rode ---")
+    print("A Local RPLInstanceID is a reactive route, a Global one is the base DODAG. Loops")
+    print("are normalised per 1000 forwarded data packets because a run that delivers more")
+    print("data has more chances to walk a loop at all.")
+    print(f"{'arm':<13} {'base':>7} {'local':>7} {'per1k base':>11} {'per1k local':>12} "
+          f"{'zero-failure runs':>18}")
+    for a in present:
+        x = df[df.arm == a]
+        fwd = (x.dataPacketsRx * x.avgHops).mean()
+        clean = x[x.discoveryAttempts == x.discoverySuccess]
+        print(f"{a:<13} {x.loopCountBase.mean():7.2f} {x.loopCountLocal.mean():7.2f} "
+              f"{(1000 * x.loopCountBase.mean() / fwd if fwd else 0):11.2f} "
+              f"{(1000 * x.loopCountLocal.mean() / fwd if fwd else 0):12.2f} "
+              f"{len(clean):6d} runs, base {clean.loopCountBase.mean():5.2f}")
+
+    print("\n--- neighbour discovery by ICMPv6 type: the price of a unicast reply path ---")
+    print(f"{'arm':<13} {'RS':>6} {'RA':>6} {'NS':>8} {'NA':>6} {'Redir':>6} {'MAC drops':>10}")
+    for a in present:
+        x = df[df.arm == a]
+        print(f"{a:<13} {x.ndRs.mean():6.0f} {x.ndRa.mean():6.0f} {x.ndNs.mean():8.0f} "
+              f"{x.ndNa.mean():6.0f} {x.ndRedirect.mean():6.0f} {x.macTxDrops.mean():10.0f}")
 
     print("\n--- median gap between one node's consecutive DIOs for the same temporary DODAG ---")
     print("Imax = AodvDioIntervalMin << AodvDioIntervalDoublings. A gap at Imax means the")
