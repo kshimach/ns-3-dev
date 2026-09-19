@@ -569,9 +569,46 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
     Ipv6Header ipHeader;
     copy->RemoveHeader(ipHeader);
     g_ipTxPackets++;
+
+    // Walk any extension headers before deciding what this packet is. Doing
+    // it here rather than only on the data path below is load-bearing: an RPL
+    // control message routed over a *reactive* route gets an RFC 6553 RPI
+    // Hop-by-Hop option prepended by PrepareOutgoingPacket(), so the outer
+    // IPv6 header's NextHeader is 0, not 58, and testing for ICMPv6 directly
+    // makes the packet invisible to the whole control-plane ledger. The
+    // P2P-DRO-ACK is exactly that case -- it is unicast to the Target over
+    // the hop-by-hop route the discovery just installed -- and it read as
+    // zero P2P-DRO-ACKs ever sent until this walk was hoisted above the
+    // check.
+    // Skipped by RFC 8200's own length rule rather than with
+    // Ipv6ExtensionHeader::RemoveHeader(): the generic extension header
+    // consumes only its two-byte prefix, which leaves the iterator inside the
+    // option data, so anything read afterwards -- an ICMPv6 type, say --
+    // comes off the wrong offset. That misalignment is invisible if the walk
+    // is only used to test NextHeader, which is why the data-side walk this
+    // replaces never showed it.
+    uint8_t nextHeader = ipHeader.GetNextHeader();
+    while (nextHeader == Ipv6Header::IPV6_EXT_HOP_BY_HOP ||
+          nextHeader == Ipv6Header::IPV6_EXT_ROUTING ||
+          nextHeader == Ipv6Header::IPV6_EXT_DESTINATION)
+    {
+        uint8_t prefix[2];
+        if (copy->CopyData(prefix, 2) < 2)
+        {
+            return;
+        }
+        uint32_t extLen = (static_cast<uint32_t>(prefix[1]) + 1) * 8;
+        if (copy->GetSize() < extLen)
+        {
+            return;
+        }
+        copy->RemoveAtStart(extLen);
+        nextHeader = prefix[0];
+    }
+
     {
         std::string kind = "other";
-        if (ipHeader.GetNextHeader() == Icmpv6L4Protocol::GetStaticProtocolNumber())
+        if (nextHeader == Icmpv6L4Protocol::GetStaticProtocolNumber())
         {
             Icmpv6Header ih;
             copy->PeekHeader(ih);
@@ -590,7 +627,7 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
             g_ipOver90ByKind[kind]++;
         }
     }
-    if (ipHeader.GetNextHeader() == Icmpv6L4Protocol::GetStaticProtocolNumber())
+    if (nextHeader == Icmpv6L4Protocol::GetStaticProtocolNumber())
     {
         Icmpv6Header icmpHeader;
         copy->PeekHeader(icmpHeader);
@@ -694,25 +731,11 @@ OnIpv6Tx(Ptr<const Packet> packet, Ptr<Ipv6> ipv6, uint32_t interface)
             return;
         }
     }
-    // Data packets in Storing/Non-storing mode carry an RFC 6553 RPI
-    // Hop-by-Hop option (and, non-storing downward, an RFC 6554 SRH Routing
-    // header) ahead of the UDP header, so NextHeader on the outer IPv6
-    // header is *not* directly UdpL4Protocol::PROT_NUMBER for most data
-    // packets -- walk any extension headers generically (same pitfall
-    // rpl-paper-evaluation.cc's own doc comment warns FlowMonitor falls
-    // into) before checking for UDP.
-    uint8_t nextHeader = ipHeader.GetNextHeader();
-    while (nextHeader == Ipv6Header::IPV6_EXT_HOP_BY_HOP ||
-          nextHeader == Ipv6Header::IPV6_EXT_ROUTING ||
-          nextHeader == Ipv6Header::IPV6_EXT_DESTINATION)
-    {
-        Ipv6ExtensionHeader ext;
-        if (copy->RemoveHeader(ext) == 0)
-        {
-            return;
-        }
-        nextHeader = ext.GetNextHeader();
-    }
+    // Data packets in Storing/Non-storing mode carry the same RFC 6553 RPI
+    // (and, non-storing downward, an RFC 6554 SRH Routing header) ahead of
+    // the UDP header -- the walk above has already stepped past both, the
+    // same pitfall rpl-paper-evaluation.cc's own doc comment warns
+    // FlowMonitor falls into.
     if (nextHeader == UdpL4Protocol::PROT_NUMBER)
     {
         g_dataBytes += packet->GetSize();
