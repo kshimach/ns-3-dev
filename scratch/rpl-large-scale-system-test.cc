@@ -1534,10 +1534,24 @@ main(int argc, char** argv)
     // and they take the generic RFC 6550 section 8.3 consistency rule, which
     // restarts Trickle on any preferred-parent change rather than only on a
     // rank improvement. -1 / false keep both as they are.
-    int32_t aodvDioRedundancy = -1;
-    int32_t aodvMaxRankIncrease = -1;
+    // -2 means "do not touch the attribute", so the module's own default is
+    // what gets measured; -1 is a real value these two attributes accept
+    // (inherit the base DODAG's) and has to stay distinguishable from it.
+    static constexpr int32_t kLeaveModuleDefault = -2;
+    int32_t aodvDioRedundancy = kLeaveModuleDefault;
+    int32_t aodvMaxRankIncrease = kLeaveModuleDefault;
     bool aodvTrickleRankOnlyReset = false;
-    bool aodvGratuitousRrepOnce = false;
+    int32_t aodvGratuitousRrepOnce = -1; // -1 leave alone, 0 false, 1 true
+    // The 'L' field bounding how long a node may belong to a temporary
+    // instance, and the Rank ceiling bounding how far the flood spreads.
+    // Both protocols have them and their module defaults differ -- AODV-RPL's
+    // L is 1 (16 s) against P2P-RPL's 2 (64 s) -- so a comparison that does
+    // not say so is comparing two different discovery durations. -1 leaves
+    // the module default alone.
+    int32_t aodvLifetime = -1;
+    int32_t p2pLifetime = -1;
+    int32_t aodvRankLimit = -1;
+    int32_t p2pMaxRank = -1;
     bool p2pDroAckRequested = true;
     // Evaluation-plan item C-3: directional channel-quality coefficient for
     // H8's external validity (does AODV-RPL's asymmetric mode pay off once
@@ -1610,20 +1624,35 @@ main(int argc, char** argv)
                  "AODV-RPL discovery Trickle doublings (module default 4)",
                  aodvDioIntervalDoublings);
     cmd.AddValue("aodvDioRedundancy",
-                 "Trickle k for AODV-RPL RREQ/RREP-DIOs, -1 to inherit dioRedundancy",
+                 "Trickle k for AODV-RPL RREQ/RREP-DIOs; -1 inherits dioRedundancy, "
+                 "-2 (default) leaves the module's own value alone",
                  aodvDioRedundancy);
     cmd.AddValue("aodvMaxRankIncrease",
                  "DAGMaxRankIncrease for AODV-RPL RREQ/RREP-Instances, 0 to disable local "
-                 "repair as RFC 6997 has P2P-RPL do, -1 to inherit the base DODAG's",
+                 "repair as RFC 6997 has P2P-RPL do, -1 inherits the base DODAG's, "
+                 "-2 (default) leaves the module's own value alone",
                  aodvMaxRankIncrease);
     cmd.AddValue("aodvTrickleRankOnlyReset",
                  "Restart the AODV-RPL discovery Trickle only on a rank improvement, as "
                  "RFC 6997 section 9.2 has P2P-RPL do (module default false)",
                  aodvTrickleRankOnlyReset);
     cmd.AddValue("aodvGratuitousRrepOnce",
-                 "Send at most one AODV-RPL Gratuitous RREP per instance and target "
-                 "(module default false)",
+                 "Send at most one AODV-RPL Gratuitous RREP per instance and target: "
+                 "1 yes, 0 no, -1 (default) leaves the module's own value alone",
                  aodvGratuitousRrepOnce);
+    cmd.AddValue("aodvLifetime",
+                 "AODV-RPL RREQ 'L' field 0..3 (0=no limit, 1=16s, 2=64s, 3=256s); "
+                 "-1 keeps the module default (1)",
+                 aodvLifetime);
+    cmd.AddValue("p2pLifetime",
+                 "P2P-RPL 'L' field 0..3, same encoding; -1 keeps the module default (2)",
+                 p2pLifetime);
+    cmd.AddValue("aodvRankLimit",
+                 "RankLimit on AODV-RPL RREQ-DIOs, 0 = no limit; -1 keeps the default (8)",
+                 aodvRankLimit);
+    cmd.AddValue("p2pMaxRank",
+                 "MaxRank on P2P mode DIOs, 0 = no limit; -1 keeps the default (8)",
+                 p2pMaxRank);
     cmd.AddValue("p2pDroAckRequested",
                  "Whether P2P-RPL requests a P2P-DRO-ACK for its replies (module default true)",
                  p2pDroAckRequested);
@@ -1811,10 +1840,39 @@ main(int argc, char** argv)
     rplHelper.Set("P2pDioIntervalDoublings", UintegerValue(p2pDioIntervalDoublings));
     rplHelper.Set("AodvDioIntervalMin", TimeValue(MilliSeconds(aodvDioIntervalMinMs)));
     rplHelper.Set("AodvDioIntervalDoublings", UintegerValue(aodvDioIntervalDoublings));
-    rplHelper.Set("AodvDioRedundancy", IntegerValue(aodvDioRedundancy));
-    rplHelper.Set("AodvMaxRankIncrease", IntegerValue(aodvMaxRankIncrease));
+    // Passed through only when asked for, like the four below: pinning them
+    // unconditionally would mean this harness never measures what the module
+    // actually ships, which is exactly the trap it walked into once already
+    // after AodvDioRedundancy and AodvGratuitousRrepOnce became defaults.
+    if (aodvDioRedundancy != kLeaveModuleDefault)
+    {
+        rplHelper.Set("AodvDioRedundancy", IntegerValue(aodvDioRedundancy));
+    }
+    if (aodvMaxRankIncrease != kLeaveModuleDefault)
+    {
+        rplHelper.Set("AodvMaxRankIncrease", IntegerValue(aodvMaxRankIncrease));
+    }
     rplHelper.Set("AodvTrickleRankOnlyReset", BooleanValue(aodvTrickleRankOnlyReset));
-    rplHelper.Set("AodvGratuitousRrepOnce", BooleanValue(aodvGratuitousRrepOnce));
+    if (aodvGratuitousRrepOnce >= 0)
+    {
+        rplHelper.Set("AodvGratuitousRrepOnce", BooleanValue(aodvGratuitousRrepOnce != 0));
+    }
+    if (aodvLifetime >= 0)
+    {
+        rplHelper.Set("AodvLifetime", UintegerValue(static_cast<uint8_t>(aodvLifetime)));
+    }
+    if (p2pLifetime >= 0)
+    {
+        rplHelper.Set("P2pLifetime", UintegerValue(static_cast<uint8_t>(p2pLifetime)));
+    }
+    if (aodvRankLimit >= 0)
+    {
+        rplHelper.Set("AodvRankLimit", UintegerValue(static_cast<uint8_t>(aodvRankLimit)));
+    }
+    if (p2pMaxRank >= 0)
+    {
+        rplHelper.Set("P2pMaxRank", UintegerValue(static_cast<uint8_t>(p2pMaxRank)));
+    }
     rplHelper.Set("P2pDroAckRequested", BooleanValue(p2pDroAckRequested));
     if (scenario == 1)
     {
