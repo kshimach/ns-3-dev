@@ -1524,7 +1524,7 @@ main(int argc, char** argv)
     // only at each protocol's own module default. Defaults below reproduce
     // contrib/rpl's module defaults (rpl.rst "Attributes"), so omitting
     // these flags changes nothing.
-    uint32_t p2pDioIntervalMinMs = 64;
+    uint32_t p2pDioIntervalMinMs = 128;
     uint32_t p2pDioIntervalDoublings = 4;
     uint32_t aodvDioIntervalMinMs = 128;
     uint32_t aodvDioIntervalDoublings = 4;

@@ -60,3 +60,9 @@
 # re-measurement drops from hours to minutes.
 !run-tier2-parallel.sh
 !run-aodv-control-cost-parallel.sh
+
+# Does each reactive protocol's own Trickle Imin default hold up? P2P-RPL's
+# 64 ms is RFC 6997 section 6.1's recommended value; AODV-RPL's 128 ms had no
+# recorded justification at all. Sweep and adoption test.
+!run-imin-sweep.sh
+!analyze-trickle-imin.py
