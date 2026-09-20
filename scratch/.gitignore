@@ -53,3 +53,10 @@
 # become module defaults, and its analysis.
 !run-aodv-defaults-sweep.sh
 !analyze-aodv-defaults.py
+
+# Parallel runners for the two sweeps above. ./ns3 run costs about 5 s of
+# CMake/python startup against a 0.55 s simulation, so these invoke the built
+# binary directly and split the job list across workers; a 2,800-run Tier 2
+# re-measurement drops from hours to minutes.
+!run-tier2-parallel.sh
+!run-aodv-control-cost-parallel.sh
