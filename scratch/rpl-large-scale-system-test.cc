@@ -1542,6 +1542,8 @@ main(int argc, char** argv)
     int32_t aodvMaxRankIncrease = kLeaveModuleDefault;
     bool aodvTrickleRankOnlyReset = false;
     int32_t aodvGratuitousRrepOnce = -1; // -1 leave alone, 0 false, 1 true
+    int32_t aodvGratuitousRrepRelay = -1; // same encoding
+    int32_t aodvGratuitousRrep = -1;      // same encoding: take section 7's MAY at all
     // The 'L' field bounding how long a node may belong to a temporary
     // instance, and the Rank ceiling bounding how far the flood spreads.
     // Both protocols have them and their module defaults differ -- AODV-RPL's
@@ -1640,6 +1642,14 @@ main(int argc, char** argv)
                  "Send at most one AODV-RPL Gratuitous RREP per instance and target: "
                  "1 yes, 0 no, -1 (default) leaves the module's own value alone",
                  aodvGratuitousRrepOnce);
+    cmd.AddValue("aodvGratuitousRrep",
+                 "Take RFC 9854 section 7's Gratuitous RREP shortcut at all: "
+                 "1 yes, 0 no, -1 (default) leaves the module's own value alone",
+                 aodvGratuitousRrep);
+    cmd.AddValue("aodvGratuitousRrepRelay",
+                 "Follow a Gratuitous RREP with RFC 9854 section 7's unicast RREQ relaying: "
+                 "1 yes, 0 no, -1 (default) leaves the module's own value alone",
+                 aodvGratuitousRrepRelay);
     cmd.AddValue("aodvLifetime",
                  "AODV-RPL RREQ 'L' field 0..3 (0=no limit, 1=16s, 2=64s, 3=256s); "
                  "-1 keeps the module default (1)",
@@ -1856,6 +1866,14 @@ main(int argc, char** argv)
     if (aodvGratuitousRrepOnce >= 0)
     {
         rplHelper.Set("AodvGratuitousRrepOnce", BooleanValue(aodvGratuitousRrepOnce != 0));
+    }
+    if (aodvGratuitousRrep >= 0)
+    {
+        rplHelper.Set("AodvGratuitousRrep", BooleanValue(aodvGratuitousRrep != 0));
+    }
+    if (aodvGratuitousRrepRelay >= 0)
+    {
+        rplHelper.Set("AodvGratuitousRrepRelay", BooleanValue(aodvGratuitousRrepRelay != 0));
     }
     if (aodvLifetime >= 0)
     {

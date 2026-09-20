@@ -36,6 +36,8 @@ declare -a ARMS=(
   "k1grrep|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvGratuitousRrepOnce=true"
   "k1mri0|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0"
   "all3|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0 --aodvGratuitousRrepOnce=true"
+  "s7relay|--reactiveProtocol=aodvrpl --aodvGratuitousRrepRelay=1"
+  "s7off|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=0"
   "p2p|--reactiveProtocol=p2prpl"
 )
 

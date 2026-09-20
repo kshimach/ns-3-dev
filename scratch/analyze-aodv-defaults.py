@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 RNG = np.random.default_rng(20260919)
-ARMS = ["asis", "grrep", "k1", "k1grrep", "k1mri0", "all3", "p2p"]
+ARMS = ["asis", "s7relay", "s7off", "grrep", "k1", "k1grrep", "k1mri0", "all3", "p2p"]
 OPS = ["m6-sym", "m6-pen6", "m6-asym6", "m9-sym", "m9-pen6", "m9-asym6"]
 
 # metric -> (better direction, label). +1 means larger is better.
