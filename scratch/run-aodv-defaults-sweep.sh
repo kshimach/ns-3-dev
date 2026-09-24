@@ -23,6 +23,7 @@ rm -f "$OUT" "$OUT.tc" "$OUT.cells"
 # and flood a whole RREP-Instance instead. Suppression affects the two very
 # differently, so a knob cleared for one says nothing about the other.
 EXTRA="${EXTRA:-}"
+# ONLY="asis s7relay" restricts the sweep to those arm labels.
 
 BASE="--link=lrwpan --ocp=mrhof --nNodes=25 --topology=grid --scenario=6 \
 --payloadBytes=32 --bgIntervalS=60 --dioIntervalMinMs=4096 --dioIntervalDoublings=8 \
@@ -36,7 +37,7 @@ declare -a ARMS=(
   "k1grrep|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvGratuitousRrepOnce=true"
   "k1mri0|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0"
   "all3|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0 --aodvGratuitousRrepOnce=true"
-  "s7relay|--reactiveProtocol=aodvrpl --aodvGratuitousRrepRelay=1"
+  "s7relay|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=1 --aodvGratuitousRrepRelay=1"
   "s7off|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=0"
   "p2p|--reactiveProtocol=p2prpl"
 )
@@ -60,6 +61,9 @@ for run in $(seq 1 "$SEEDS"); do
     for arm in "${ARMS[@]}"; do
       armLabel="${arm%%|*}"
       armFlags="${arm#*|}"
+      if [[ -n "${ONLY:-}" && " $ONLY " != *" $armLabel "* ]]; then
+        continue
+      fi
       if ./ns3 run --no-build "rpl-large-scale-system-test $BASE $opFlags $armFlags \
 --RngRun=$run --csv=$OUT --tcCsv=$OUT.tc" > /dev/null 2>&1; then
         echo "$armLabel,$opLabel" >> "$OUT.cells"
