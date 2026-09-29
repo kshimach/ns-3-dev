@@ -36,7 +36,7 @@ import pandas as pd
 RNG = np.random.default_rng(20260920)
 
 # protocol -> the Imin (ms) it ships with today.
-DEFAULTS = {"p2prpl": 64, "aodvrpl": 128}
+DEFAULTS = {"p2prpl": 128, "aodvrpl": 128}
 
 # metric -> (better direction, label). +1 means larger is better.
 METRICS = [

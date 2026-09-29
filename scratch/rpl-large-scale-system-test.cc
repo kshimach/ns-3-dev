@@ -259,6 +259,18 @@ class NodeOffsetLossModel : public PropagationLossModel
 // --link=lrwpan air-interface counters (frames actually put on the air,
 // retries and ACKs included, and what the PHY/MAC gave up on) -- the
 // UDGM path has no equivalent, so these stay 0 there.
+// Per-node last lr-wpan PHY state change, to count radios wedged in BUSY_RX
+// (a real reception lasts milliseconds; see design-constraints.md section 98).
+static std::map<uint32_t, std::pair<Time, lrwpan::PhyEnumeration>> g_phyLastState;
+
+static void
+PhyTrxStateChange(std::string ctx, Time, lrwpan::PhyEnumeration, lrwpan::PhyEnumeration now)
+{
+    // ctx: /NodeList/<id>/DeviceList/...
+    uint32_t id = std::stoul(ctx.substr(10, ctx.find('/', 10) - 10));
+    g_phyLastState[id] = {Simulator::Now(), now};
+}
+
 static uint64_t g_phyTxFrames = 0;
 static uint64_t g_phyTxBytes = 0;
 static uint64_t g_ndPackets = 0;   // IPv6 neighbour discovery (RS/RA/NS/NA/redirect) sent, per hop
@@ -2312,8 +2324,29 @@ main(int argc, char** argv)
         Simulator::Schedule(Seconds(settleTime + 115.0), []() { g_dioWindowActive = false; });
     }
 
+    if (link == "lrwpan")
+    {
+        Config::Connect("/NodeList/*/DeviceList/*/$ns3::lrwpan::LrWpanNetDevice/Phy/TrxState",
+                        MakeCallback(&PhyTrxStateChange));
+    }
+
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
+
+    if (link == "lrwpan")
+    {
+        uint32_t stuck = 0;
+        for (const auto& [id, last] : g_phyLastState)
+        {
+            if (last.second == lrwpan::IEEE_802_15_4_PHY_BUSY_RX &&
+                Simulator::Now() - last.first > Seconds(30))
+            {
+                stuck++;
+            }
+        }
+        std::cout << " lr-wpan PHY stuck in BUSY_RX (>30 s at end): " << stuck << " of "
+                  << nNodes << " nodes\n";
+    }
 
     //
     // ===================== Result compilation =====================

@@ -38,7 +38,7 @@ import pandas as pd
 
 RNG = np.random.default_rng(20260919)
 ORDER = ["A-baseline", "B-k1", "C-reset", "D-k1+reset", "E-grrep", "F-all", "H-mri0",
-         "I-all+mri0", "G-p2p-noACK", "G-p2p"]
+         "I-all+mri0", "Z-shipping", "G-p2p-noACK", "G-p2p"]
 
 
 def bootstrap_ratio_ci(numer, denom, n_boot=20000):

@@ -27,7 +27,7 @@ for margin in 6 9; do
     for imin in 32 64 128 256 512; do
       for proto in p2prpl aodvrpl; do
         for run in $(seq 1 "$SEEDS"); do
-          printf '%s %s --lrMarginDb=%s %s --reactiveProtocol=%s --p2pDioIntervalMinMs=%s --aodvDioIntervalMinMs=%s --RngRun=%s --csv=%s/%s-m%s-%s-i%03d-%04d.csv\n' \
+          printf '%s %s --lrMarginDb=%s %s --reactiveProtocol=%s --p2pDioIntervalMinMs=%s --aodvDioIntervalMinMs=%s --RngRun=%s --csv=%s/%s-m%s-%s-i%03d-%04d.csv --tcCsv=/dev/null\n' \
             "$BIN" "$BASE" "$margin" "${asym#*|}" "$proto" "$imin" "$imin" "$run" \
             "$PART" "$proto" "$margin" "${asym%%|*}" "$imin" "$run" >> "$PART/cmds"
         done
