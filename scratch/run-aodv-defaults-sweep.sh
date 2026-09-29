@@ -32,11 +32,11 @@ BASE="--link=lrwpan --ocp=mrhof --nNodes=25 --topology=grid --scenario=6 \
 
 declare -a ARMS=(
   "asis|--reactiveProtocol=aodvrpl"
-  "grrep|--reactiveProtocol=aodvrpl --aodvGratuitousRrepOnce=true"
+  "grrep|--reactiveProtocol=aodvrpl --aodvGratuitousRrepOnce=1"
   "k1|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1"
-  "k1grrep|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvGratuitousRrepOnce=true"
+  "k1grrep|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvGratuitousRrepOnce=1"
   "k1mri0|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0"
-  "all3|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0 --aodvGratuitousRrepOnce=true"
+  "all3|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0 --aodvGratuitousRrepOnce=1"
   "s7relay|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=1 --aodvGratuitousRrepRelay=1"
   "s7off|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=0"
   "p2p|--reactiveProtocol=p2prpl"
