@@ -447,6 +447,12 @@ LrWpanPhy::EndPreamble(Ptr<LrWpanSpectrumSignalParameters> lrWpanRxParams)
 
             // Start tracking the packet interference
             m_currentRxPacket = std::make_pair(lrWpanRxParams, false);
+            // m_isRxCanceled belongs to the packet m_currentRxPacket tracks, and
+            // only that packet's EndRx() clears it. If the cancelled packet's
+            // EndRx() arrives after a new packet has taken its place, the flag
+            // survives, and the next packet lost to interference skips the
+            // return to RX_ON in EndRx(), leaving the PHY in BUSY_RX forever.
+            m_isRxCanceled = false;
             m_phyRxBeginTrace(p);
 
             m_rxLastUpdate = Simulator::Now();
@@ -455,6 +461,7 @@ LrWpanPhy::EndPreamble(Ptr<LrWpanSpectrumSignalParameters> lrWpanRxParams)
         {
             // The packet is *undecodable* drop it.
             m_currentRxPacket = std::make_pair(lrWpanRxParams, true);
+            m_isRxCanceled = false; // same reason as above
             m_phyRxDropTrace(p);
             NS_LOG_INFO(this << " packet undecodable due to low SINR: " << 10 * log10(sinr)
                              << " dB");
