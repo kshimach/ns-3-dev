@@ -15,6 +15,9 @@ set -euo pipefail
 cd /Users/kawashy/ns-3-dev
 OUT="${1:?usage: run-aodv-defaults-sweep.sh <out.csv> [seeds]}"
 SEEDS="${2:-50}"
+# SEED0 shifts the seed block (RngRun = SEED0+1 .. SEED0+SEEDS), for a second,
+# independent block.
+SEED0="${SEED0:-0}"
 rm -f "$OUT" "$OUT.tc" "$OUT.cells"
 
 # EXTRA lets the same sweep be re-run over a different reply path, which is
@@ -37,6 +40,11 @@ declare -a ARMS=(
   "k1grrep|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvGratuitousRrepOnce=1"
   "k1mri0|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0"
   "all3|--reactiveProtocol=aodvrpl --aodvDioRedundancy=1 --aodvMaxRankIncrease=0 --aodvGratuitousRrepOnce=1"
+  "k2|--reactiveProtocol=aodvrpl --aodvDioRedundancy=2"
+  "k3|--reactiveProtocol=aodvrpl --aodvDioRedundancy=3"
+  "k5|--reactiveProtocol=aodvrpl --aodvDioRedundancy=5"
+  "imin64|--reactiveProtocol=aodvrpl --aodvDioIntervalMinMs=64"
+  "imin256|--reactiveProtocol=aodvrpl --aodvDioIntervalMinMs=256"
   "s7relay|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=1 --aodvGratuitousRrepRelay=1"
   "s7off|--reactiveProtocol=aodvrpl --aodvGratuitousRrep=0"
   "p2p|--reactiveProtocol=p2prpl"
@@ -54,7 +62,7 @@ declare -a OPS=(
 
 n=0
 fail=0
-for run in $(seq 1 "$SEEDS"); do
+for run in $(seq $((SEED0 + 1)) $((SEED0 + SEEDS))); do
   for op in "${OPS[@]}"; do
     opLabel="${op%%|*}"
     opFlags="${op#*|}"
